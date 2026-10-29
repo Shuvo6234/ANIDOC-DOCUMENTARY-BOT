@@ -1,11 +1,10 @@
 import os
 import sys
 import json
-import time
+import base64
 from pathlib import Path
 
-from google import genai
-from google.genai import types
+import requests
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -13,39 +12,46 @@ from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
 
+# ==========================================
+# CONFIGURATION
+# ==========================================
+
 PROJECT_DIR = Path(__file__).parent
 OUTPUT_DIR = PROJECT_DIR / "output"
 
 DRIVE_FOLDER_ID = "1tOKfM5wPPIA42gTUzVQUsgm295mzPqeJ"
 
-IMAGE_MODEL = "gemini-3.1-flash-image"
+IMAGE_MODEL = "@cf/bytedance/stable-diffusion-xl-lightning"
 
 IMAGE_PATH = OUTPUT_DIR / "image_generation_test.png"
 
+CLOUDFLARE_API_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
 
-def get_api_keys():
-    raw_keys = os.getenv("GEMINI_API_KEYS", "").strip()
 
-    if not raw_keys:
+# ==========================================
+# CLOUDFLARE CONFIGURATION
+# ==========================================
+
+def get_cloudflare_config():
+    token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+    account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+
+    if not token:
         raise RuntimeError(
-            "GEMINI_API_KEYS secret is missing."
+            "CLOUDFLARE_API_TOKEN GitHub Secret is missing."
         )
 
-    # Supports one key per line or comma-separated keys.
-    keys = []
+    if not account_id:
+        raise RuntimeError(
+            "CLOUDFLARE_ACCOUNT_ID GitHub Secret is missing."
+        )
 
-    for line in raw_keys.splitlines():
-        for item in line.split(","):
-            key = item.strip()
+    return token, account_id
 
-            if key and key not in keys:
-                keys.append(key)
 
-    if not keys:
-        raise RuntimeError("No API keys were found.")
-
-    return keys
-
+# ==========================================
+# GOOGLE DRIVE CONNECTION
+# ==========================================
 
 def connect_google_drive():
     raw_credentials = os.getenv(
@@ -91,122 +97,194 @@ def connect_google_drive():
     return drive_service
 
 
-def is_quota_or_temporary_error(error):
-    """
-    Rotate to the next key for quota/rate-limit and
-    temporary server errors. Do not retry every kind
-    of error because some errors will affect all keys.
-    """
+# ==========================================
+# IMAGE GENERATION
+# ==========================================
 
-    message = str(error).lower()
-
-    retry_markers = [
-        "429",
-        "resource_exhausted",
-        "resource exhausted",
-        "quota exceeded",
-        "rate limit",
-        "too many requests",
-        "503",
-        "service unavailable",
-        "500",
-        "internal server error",
-    ]
-
-    return any(marker in message for marker in retry_markers)
-
-
-def generate_test_image(api_keys):
+def generate_test_image(token, account_id):
     prompt = """
-Create one cinematic 16:9 documentary illustration
-in a semi-realistic 2D animation style.
+Cinematic documentary illustration, semi-realistic 2D
+animation style, historical India in the 1940s.
 
-Scene: An old Indian railway station at night during
-the 1940s, with a steam locomotive, a few distant
-silhouettes, warm lantern light, light mist, historically
-appropriate architecture and clothing.
+An old Indian railway station at night, a steam locomotive,
+distant human silhouettes, warm lantern light and light mist.
 
-Use clean outlines, realistic South Asian environments,
-muted warm colors, dramatic cinematic lighting, detailed
-backgrounds and a serious documentary atmosphere.
+Historically appropriate Indian architecture and clothing.
+Detailed South Asian environment, clean outlines, muted
+warm colors, dramatic cinematic lighting, serious
+historical documentary atmosphere.
 
 Wide landscape composition, 16:9 aspect ratio.
-No text, no subtitles, no logos, no watermark text.
+No text, no subtitles, no logos, no watermark.
 """
 
-    total_keys = len(api_keys)
+    url = CLOUDFLARE_API_URL.format(
+        account_id=account_id,
+        model=IMAGE_MODEL,
+    )
 
-    for index, api_key in enumerate(api_keys, start=1):
-        print(f"Testing image generation with API key {index}/{total_keys}...")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
 
+    payload = {
+        "prompt": prompt,
+        "width": 1024,
+        "height": 576,
+        "num_steps": 4,
+    }
+
+    print("Image model:", IMAGE_MODEL)
+    print("Sending one image-generation request...")
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=300,
+        )
+
+    except requests.RequestException as error:
+        raise RuntimeError(
+            "Could not connect to Cloudflare image API. "
+            f"Error type: {type(error).__name__}"
+        ) from None
+
+    if response.status_code != 200:
+        print(
+            "Cloudflare API returned HTTP status:",
+            response.status_code,
+        )
+
+        # Print a limited error response, but never print
+        # request headers or the API token.
         try:
-            client = genai.Client(api_key=api_key)
+            error_data = response.json()
+            errors = error_data.get("errors", [])
 
-            response = client.models.generate_content(
-                model=IMAGE_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE"],
-                    image_config=types.ImageConfig(
-                        aspect_ratio="16:9"
-                    ),
-                ),
-            )
-
-            for part in response.parts:
-                if part.inline_data is not None:
-                    image = part.as_image()
-                    image.save(str(IMAGE_PATH))
-
-                    if not IMAGE_PATH.exists() or IMAGE_PATH.stat().st_size == 0:
-                        raise RuntimeError(
-                            "Image response received, but image file is empty."
-                        )
-
-                    print("IMAGE GENERATION SUCCESSFUL.")
-                    print("Model:", IMAGE_MODEL)
-                    print("Image saved:", IMAGE_PATH.name)
-                    print("Image size:", IMAGE_PATH.stat().st_size, "bytes")
-
-                    return True
-
-            print("This key returned no image.")
-
-            # No image returned: stop rather than sending
-            # repeated potentially chargeable requests.
-            return False
-
-        except Exception as error:
-            print(
-                f"Key {index} failed with error type: "
-                f"{type(error).__name__}"
-            )
-
-            # Do not print the full exception because
-            # error details may contain sensitive request data.
-            message = str(error)
-            print("Error:", message[:500])
-
-            if is_quota_or_temporary_error(error):
-                if index < total_keys:
-                    print("Trying the next API key...")
-                    time.sleep(2)
-                    continue
-
-            else:
+            for item in errors[:3]:
                 print(
-                    "Error is not clearly a quota/rate-limit "
-                    "error. Stopping to avoid unnecessary requests."
+                    "API error:",
+                    str(item.get("message", "Unknown error"))[:300],
                 )
-                return False
 
-    print("All API keys were tried, but image generation failed.")
-    return False
+        except (ValueError, AttributeError):
+            print("Cloudflare returned an unexpected error response.")
 
+        if response.status_code == 401:
+            raise RuntimeError(
+                "Authentication failed. Check the Cloudflare API token."
+            )
+
+        if response.status_code == 403:
+            raise RuntimeError(
+                "Access denied. Check Workers AI permissions and account access."
+            )
+
+        if response.status_code == 429:
+            raise RuntimeError(
+                "Rate limit or usage quota reached. "
+                "Check Cloudflare Workers AI usage."
+            )
+
+        raise RuntimeError(
+            f"Image generation failed with HTTP {response.status_code}."
+        )
+
+    content_type = response.headers.get(
+        "Content-Type", ""
+    ).lower()
+
+    image_bytes = None
+
+    # Most image API responses are returned as binary image data.
+    if content_type.startswith("image/"):
+        image_bytes = response.content
+
+    else:
+        # Also support JSON responses containing a base64 image.
+        try:
+            data = response.json()
+        except ValueError:
+            raise RuntimeError(
+                "Cloudflare returned an unknown response format."
+            ) from None
+
+        result = data.get("result")
+
+        if isinstance(result, str):
+            try:
+                image_bytes = base64.b64decode(
+                    result,
+                    validate=True,
+                )
+            except (ValueError, base64.binascii.Error):
+                raise RuntimeError(
+                    "Could not decode the returned image."
+                ) from None
+
+        elif isinstance(result, dict):
+            image_value = result.get("image")
+
+            if isinstance(image_value, str):
+                try:
+                    image_bytes = base64.b64decode(
+                        image_value,
+                        validate=True,
+                    )
+                except (ValueError, base64.binascii.Error):
+                    raise RuntimeError(
+                        "Could not decode the returned image."
+                    ) from None
+
+        if not image_bytes:
+            raise RuntimeError(
+                "The API response did not contain a usable image."
+            )
+
+    if not image_bytes:
+        raise RuntimeError("The generated image is empty.")
+
+    # Check that the output looks like a PNG or JPEG.
+    is_png = image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    is_jpeg = image_bytes.startswith(b"\xff\xd8\xff")
+
+    if not is_png and not is_jpeg:
+        raise RuntimeError(
+            "The API response is not a recognized PNG or JPEG image."
+        )
+
+    global IMAGE_PATH
+
+    if is_jpeg:
+        IMAGE_PATH = OUTPUT_DIR / "image_generation_test.jpg"
+    else:
+        IMAGE_PATH = OUTPUT_DIR / "image_generation_test.png"
+
+    IMAGE_PATH.write_bytes(image_bytes)
+
+    print("IMAGE GENERATION SUCCESSFUL.")
+    print("Image file:", IMAGE_PATH.name)
+    print("Image size:", IMAGE_PATH.stat().st_size, "bytes")
+
+    return True
+
+
+# ==========================================
+# UPLOAD IMAGE TO GOOGLE DRIVE
+# ==========================================
 
 def upload_image_to_drive(drive_service):
     if not IMAGE_PATH.exists():
-        raise RuntimeError("Test image file does not exist.")
+        raise RuntimeError("Generated image file does not exist.")
+
+    mime_type = (
+        "image/jpeg"
+        if IMAGE_PATH.suffix.lower() == ".jpg"
+        else "image/png"
+    )
 
     file_metadata = {
         "name": IMAGE_PATH.name,
@@ -215,7 +293,7 @@ def upload_image_to_drive(drive_service):
 
     media = MediaFileUpload(
         str(IMAGE_PATH),
-        mimetype="image/png",
+        mimetype=mime_type,
         resumable=True,
     )
 
@@ -228,30 +306,42 @@ def upload_image_to_drive(drive_service):
     print("IMAGE UPLOAD SUCCESSFUL.")
     print("Uploaded file:", uploaded_file.get("name"))
     print("Drive file ID:", uploaded_file.get("id"))
-    print("File size:", uploaded_file.get("size", "Unknown"), "bytes")
+    print(
+        "File size:",
+        uploaded_file.get("size", "Unknown"),
+        "bytes",
+    )
 
+
+# ==========================================
+# MAIN
+# ==========================================
 
 def main():
     print("=" * 45)
-    print("ANIDOC DOCUMENTARY BOT - IMAGE TEST")
+    print("ANIDOC DOCUMENTARY BOT")
+    print("CLOUDFLARE IMAGE GENERATION TEST")
     print("=" * 45)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     try:
-        api_keys = get_api_keys()
-        print("Gemini API keys detected:", len(api_keys))
+        token, account_id = get_cloudflare_config()
+
+        print("Cloudflare configuration detected.")
 
         drive_service = connect_google_drive()
 
-        print("Image model:", IMAGE_MODEL)
-        print("Starting one-image test...")
-
-        success = generate_test_image(api_keys)
+        success = generate_test_image(
+            token,
+            account_id,
+        )
 
         if not success:
-            print("TEST FAILED: No image was generated.")
-            sys.exit(1)
+            raise RuntimeError("Image generation failed.")
 
         upload_image_to_drive(drive_service)
 
@@ -261,13 +351,15 @@ def main():
 
     except HttpError as error:
         print("Google Drive HTTP request failed.")
-        print("HTTP status:", getattr(error.resp, "status", "Unknown"))
+        print(
+            "HTTP status:",
+            getattr(error.resp, "status", "Unknown"),
+        )
         sys.exit(1)
 
     except json.JSONDecodeError:
         print(
-            "ERROR: GOOGLE_SERVICE_ACCOUNT_JSON "
-            "is not valid JSON."
+            "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON."
         )
         sys.exit(1)
 
