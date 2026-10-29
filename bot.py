@@ -1,56 +1,40 @@
 import os
 import sys
 import json
-import base64
+import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
-import fitz  # PyMuPDF: reads the reference PDF already in the repository
-
+import fitz  # PyMuPDF
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
-
-# ==========================================
+# ============================================================
 # CONFIGURATION
-# ==========================================
+# ============================================================
 
 PROJECT_DIR = Path(__file__).parent
 OUTPUT_DIR = PROJECT_DIR / "output"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Existing Google Drive Output folder ID
 DRIVE_FOLDER_ID = "1tOKfM5wPPIA42gTUzVQUsgm295mzPqeJ"
 
-IMAGE_MODEL = "@cf/runwayml/stable-diffusion-v1-5-img2img"
-IMAGE_PATH = OUTPUT_DIR / "image_generation_test.png"
+POLLINATIONS_IMAGE_URL = "https://gen.pollinations.ai/image/"
+POLLINATIONS_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "kontext").strip() or "kontext"
 
-CLOUDFLARE_API_URL = (
-    "https://api.cloudflare.com/client/v4/accounts/"
-    "{account_id}/ai/run/{model}"
-)
+REFERENCE_PDF_NAME = "ANIDOC MAGICAL PROMPT v4.pdf"
+REFERENCE_TEMP_NAME = f"anidoc-style-reference-{uuid.uuid4().hex}.png"
+IMAGE_PATH = OUTPUT_DIR / "image_generation_test.jpg"
 
-
-# ==========================================
-# CLOUDFLARE CONFIGURATION
-# ==========================================
-
-def get_cloudflare_config():
-    token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
-    account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
-
-    if not token:
-        raise RuntimeError("CLOUDFLARE_API_TOKEN GitHub Secret is missing.")
-    if not account_id:
-        raise RuntimeError("CLOUDFLARE_ACCOUNT_ID GitHub Secret is missing.")
-
-    return token, account_id
+TIMEOUT_SECONDS = 300
 
 
-# ==========================================
-# GOOGLE DRIVE CONNECTION (OAUTH)
-# ==========================================
+# ============================================================
+# GOOGLE DRIVE OAUTH
+# ============================================================
 
 def connect_google_drive():
     client_id = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
@@ -76,14 +60,9 @@ def connect_google_drive():
         scopes=["https://www.googleapis.com/auth/drive"],
     )
 
-    drive_service = build(
-        "drive",
-        "v3",
-        credentials=credentials,
-        cache_discovery=False,
-    )
+    drive = build("drive", "v3", credentials=credentials, cache_discovery=False)
 
-    folder = drive_service.files().get(
+    folder = drive.files().get(
         fileId=DRIVE_FOLDER_ID,
         fields="id,name,mimeType",
     ).execute()
@@ -91,58 +70,115 @@ def connect_google_drive():
     if folder.get("mimeType") != "application/vnd.google-apps.folder":
         raise RuntimeError("Configured Google Drive ID is not a folder.")
 
-    print("Google Drive connected successfully.")
+    print("Google Drive connected.")
     print("Output folder:", folder.get("name", "Unknown"))
-    return drive_service
+    return drive
 
 
-# ==========================================
-# IMAGE GENERATION
-# ==========================================
+# ============================================================
+# LOAD PDF REFERENCE IMAGE
+# ============================================================
 
-def load_pdf_style_reference():
-    """
-    Render the visual-reference page from the PDF in the repository.
-    The workflow expects the PDF to be at the repository root.
-    """
-    pdf_path = PROJECT_DIR / "ANIDOC MAGICAL PROMPT v4.pdf"
+def render_reference_page():
+    pdf_path = PROJECT_DIR / REFERENCE_PDF_NAME
+
     if not pdf_path.exists():
-        # Also accept a case-insensitive PDF filename, in case the repository
-        # filename has small capitalization differences.
         candidates = [
-            path for path in PROJECT_DIR.glob("*.pdf")
-            if "anidoc" in path.name.lower() and "magical" in path.name.lower()
+            p for p in PROJECT_DIR.glob("*.pdf")
+            if "anidoc" in p.name.lower() and "magical" in p.name.lower()
         ]
-        if candidates:
-            pdf_path = candidates[0]
-        else:
+        if not candidates:
             raise RuntimeError(
-                "Could not find 'ANIDOC MAGICAL PROMPT v4.pdf' in the repository root. "
-                "Please keep the reference PDF in the same folder as bot.py."
+                f"Could not find {REFERENCE_PDF_NAME!r} beside bot.py."
             )
+        pdf_path = candidates[0]
 
     try:
-        document = fitz.open(pdf_path)
-    except Exception as error:
+        with fitz.open(pdf_path) as document:
+            if len(document) < 4:
+                raise RuntimeError("Reference PDF has fewer than 4 pages.")
+            # Page 4 is the previously configured AniDoc style-reference page.
+            page = document[3]
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+            image_bytes = pixmap.tobytes("png")
+    except RuntimeError:
+        raise
+    except Exception as exc:
         raise RuntimeError(
-            f"Could not open the style-reference PDF ({type(error).__name__})."
+            f"Could not render reference PDF ({type(exc).__name__})."
         ) from None
 
-    if len(document) < 4:
-        document.close()
-        raise RuntimeError("The reference PDF has fewer than 4 pages.")
-
-    # Page 4 (index 3) contains the AniDoc visual-reference montage.
-    page = document[3]
-    pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-    image_bytes = pixmap.tobytes("png")
-    document.close()
-    print("Loaded style reference from:", pdf_path.name)
-    print("Reference page used: 4")
-    return image_bytes
+    local_path = OUTPUT_DIR / REFERENCE_TEMP_NAME
+    local_path.write_bytes(image_bytes)
+    print("Rendered PDF style reference page 4.")
+    return local_path
 
 
-def generate_test_image(token, account_id):
+# ============================================================
+# TEMPORARY REFERENCE HOSTING ON GOOGLE DRIVE
+# Pollinations' documented image-to-image parameter expects a URL,
+# not the base64 image payload used by the old Cloudflare code.
+# The reference image is briefly shared publicly so the API can fetch it,
+# then its public permission is removed in the cleanup function.
+# ============================================================
+
+def upload_temporary_reference(drive, reference_path):
+    metadata = {
+        "name": REFERENCE_TEMP_NAME,
+        "parents": [DRIVE_FOLDER_ID],
+    }
+    media = MediaFileUpload(str(reference_path), mimetype="image/png", resumable=True)
+    item = drive.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id,name,webViewLink",
+    ).execute()
+
+    file_id = item["id"]
+    try:
+        drive.permissions().create(
+            fileId=file_id,
+            body={"type": "anyone", "role": "reader"},
+            fields="id",
+        ).execute()
+    except Exception:
+        try:
+            drive.files().delete(fileId=file_id).execute()
+        except Exception:
+            pass
+        raise RuntimeError(
+            "Could not temporarily share the reference image for the image API. "
+            "Check whether your Google Drive policy allows public-link sharing."
+        ) from None
+
+    reference_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    print("Temporary reference image uploaded and shared for generation.")
+    return file_id, reference_url
+
+
+def delete_temporary_reference(drive, file_id):
+    if not file_id:
+        return
+    try:
+        # Delete the temporary file, which also removes its public permission.
+        drive.files().delete(fileId=file_id).execute()
+        print("Temporary reference image deleted from Drive.")
+    except Exception as exc:
+        print(
+            "WARNING: Could not delete temporary reference image. "
+            f"Please remove it from Drive manually (error: {type(exc).__name__})."
+        )
+
+
+# ============================================================
+# POLLINATIONS IMAGE GENERATION
+# ============================================================
+
+def generate_image(reference_url):
+    api_key = os.getenv("POLLINATIONS_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("POLLINATIONS_API_KEY GitHub Secret is missing.")
+
     prompt = """
 Create a NEW scene. Use the supplied image only as a visual STYLE reference;
 do not copy its characters, objects, or exact composition.
@@ -154,131 +190,83 @@ carefully detailed clothing and environment, cinematic staging.
 Muted warm amber, khaki, dusty olive, earthy brown, and deep navy palette.
 Dramatic single-source cinematic lighting, strong but natural shadows,
 subtle atmospheric depth, serious historical-documentary mood.
-The result must look like a premium illustrated documentary frame, not a
-children's cartoon, anime, 3D render, photograph, or glossy game concept art.
+Premium illustrated documentary frame, not a children's cartoon, anime,
+3D render, photograph, or glossy game concept art.
 
 SCENE:
 An old Indian railway station at night in the 1940s, a steam locomotive,
 a few distant human silhouettes, warm lantern light and light mist.
 Historically plausible Indian architecture, railway details, and clothing.
 Wide cinematic landscape framing, 16:9 composition.
-No text, no subtitles, no letters, no logos, no watermark.
-"""
+No text, subtitles, letters, logos, or watermark.
+""".strip()
 
-    url = CLOUDFLARE_API_URL.format(
-        account_id=account_id,
-        model=IMAGE_MODEL,
-    )
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+    # Pollinations uses a URL reference image, rather than Cloudflare's
+    # image_b64 JSON field. URL-encode the prompt safely.
+    encoded_prompt = quote(prompt, safe="")
+    url = f"{POLLINATIONS_IMAGE_URL}{encoded_prompt}"
 
-    reference_bytes = load_pdf_style_reference()
-    payload = {
-        "prompt": prompt,
-        "image_b64": base64.b64encode(reference_bytes).decode("ascii"),
-        "strength": 0.78,
+    params = {
+        "model": POLLINATIONS_MODEL,
+        "image": reference_url,
         "width": 1024,
         "height": 576,
-        "num_steps": 20,
-        "guidance": 7.5,
-        "negative_prompt": (
-            "photorealistic, 3D render, childish cartoon, anime, chibi, "
-            "oversaturated colors, glossy plastic skin, blurry, low detail, "
-            "text, captions, logo, watermark, distorted face, extra fingers"
-        ),
+        "seed": -1,
+        "safe": "true",
     }
+    headers = {"Authorization": f"Bearer {api_key}"}
 
-    print("Image model:", IMAGE_MODEL)
-    print("Using PDF visual reference: yes")
-    print("Sending one image-to-image request...")
+    print("Image provider: Pollinations")
+    print("Image model:", POLLINATIONS_MODEL)
+    print("Using PDF visual reference: yes (temporary Drive URL)")
+    print("Sending one image-generation request...")
 
     try:
-        response = requests.post(
+        response = requests.get(
             url,
             headers=headers,
-            json=payload,
-            timeout=300,
+            params=params,
+            timeout=TIMEOUT_SECONDS,
         )
-    except requests.RequestException as error:
+    except requests.RequestException as exc:
         raise RuntimeError(
-            "Could not connect to Cloudflare image API. "
-            f"Error type: {type(error).__name__}"
+            f"Could not connect to Pollinations ({type(exc).__name__})."
         ) from None
 
     if response.status_code != 200:
-        print("Cloudflare API returned HTTP status:", response.status_code)
-        try:
-            error_data = response.json()
-            for item in error_data.get("errors", [])[:3]:
-                print("API error:", str(item.get("message", "Unknown error"))[:300])
-            messages = " ".join(
-                str(item.get("message", "")) for item in error_data.get("errors", [])
-            ).lower()
-        except (ValueError, AttributeError):
-            messages = ""
-            print("Cloudflare returned an unexpected error response.")
-
-        if "image_b64" in messages or "image" in messages and "schema" in messages:
+        # Avoid printing response bodies that might contain private details.
+        if response.status_code in (401, 403):
             raise RuntimeError(
-                "Cloudflare rejected the reference-image input. The model API schema "
-                "may have changed; check the model's current input fields."
+                "Pollinations authentication/permission failed. Check the API key, "
+                "Image permission, and available Pollen balance."
             )
-        if response.status_code == 401:
-            raise RuntimeError("Authentication failed. Check the Cloudflare API token.")
-        if response.status_code == 403:
+        if response.status_code == 402:
             raise RuntimeError(
-                "Access denied. Check Workers AI permissions and account access."
+                "Pollinations reports insufficient Pollen/credits. Image generation "
+                "may not be free for this key."
             )
         if response.status_code == 429:
-            raise RuntimeError(
-                "Rate limit or usage quota reached. Check Cloudflare Workers AI usage."
-            )
+            raise RuntimeError("Pollinations rate limit reached; try again later.")
         raise RuntimeError(
-            f"Image generation failed with HTTP {response.status_code}."
+            f"Pollinations image generation failed with HTTP {response.status_code}."
         )
 
     content_type = response.headers.get("Content-Type", "").lower()
-    image_bytes = None
+    if not content_type.startswith("image/"):
+        raise RuntimeError(
+            "Pollinations returned a non-image response. Check the selected model "
+            "and the current API documentation."
+        )
 
-    if content_type.startswith("image/"):
-        image_bytes = response.content
-    else:
-        try:
-            data = response.json()
-        except ValueError:
-            raise RuntimeError(
-                "Cloudflare returned an unknown response format."
-            ) from None
-
-        result = data.get("result")
-        if isinstance(result, str):
-            try:
-                image_bytes = base64.b64decode(result, validate=True)
-            except (ValueError, base64.binascii.Error):
-                raise RuntimeError("Could not decode the returned image.") from None
-        elif isinstance(result, dict):
-            image_value = result.get("image")
-            if isinstance(image_value, str):
-                try:
-                    image_bytes = base64.b64decode(image_value, validate=True)
-                except (ValueError, base64.binascii.Error):
-                    raise RuntimeError("Could not decode the returned image.") from None
-
-    if not image_bytes:
-        raise RuntimeError("The API response did not contain a usable image.")
-
+    image_bytes = response.content
     is_png = image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
     is_jpeg = image_bytes.startswith(b"\xff\xd8\xff")
     if not is_png and not is_jpeg:
         raise RuntimeError("The API response is not a recognized PNG or JPEG image.")
 
     global IMAGE_PATH
-    IMAGE_PATH = (
-        OUTPUT_DIR / "image_generation_test.jpg"
-        if is_jpeg
-        else OUTPUT_DIR / "image_generation_test.png"
+    IMAGE_PATH = OUTPUT_DIR / (
+        "image_generation_test.png" if is_png else "image_generation_test.jpg"
     )
     IMAGE_PATH.write_bytes(image_bytes)
 
@@ -288,93 +276,79 @@ No text, no subtitles, no letters, no logos, no watermark.
     return True
 
 
-# ==========================================
-# UPLOAD IMAGE TO GOOGLE DRIVE
-# ==========================================
+# ============================================================
+# UPLOAD GENERATED IMAGE TO EXISTING DRIVE OUTPUT FOLDER
+# ============================================================
 
-def upload_image_to_drive(drive_service):
+def upload_image_to_drive(drive):
     if not IMAGE_PATH.exists():
         raise RuntimeError("Generated image file does not exist.")
 
-    mime_type = (
-        "image/jpeg"
-        if IMAGE_PATH.suffix.lower() == ".jpg"
-        else "image/png"
-    )
-    file_metadata = {
+    mime_type = "image/png" if IMAGE_PATH.suffix.lower() == ".png" else "image/jpeg"
+    metadata = {
         "name": IMAGE_PATH.name,
         "parents": [DRIVE_FOLDER_ID],
     }
-    media = MediaFileUpload(
-        str(IMAGE_PATH),
-        mimetype=mime_type,
-        resumable=True,
-    )
+    media = MediaFileUpload(str(IMAGE_PATH), mimetype=mime_type, resumable=True)
 
-    uploaded_file = drive_service.files().create(
-        body=file_metadata,
+    uploaded = drive.files().create(
+        body=metadata,
         media_body=media,
         fields="id,name,size,webViewLink",
     ).execute()
 
     print("IMAGE UPLOAD SUCCESSFUL.")
-    print("Uploaded file:", uploaded_file.get("name"))
-    print("Drive file ID:", uploaded_file.get("id"))
-    print("File size:", uploaded_file.get("size", "Unknown"), "bytes")
+    print("Uploaded file:", uploaded.get("name"))
+    print("Drive file ID:", uploaded.get("id"))
+    print("File size:", uploaded.get("size", "Unknown"), "bytes")
 
 
-# ==========================================
+# ============================================================
 # MAIN
-# ==========================================
+# ============================================================
 
 def main():
     print("=" * 45)
     print("ANIDOC DOCUMENTARY BOT")
-    print("CLOUDFLARE IMAGE GENERATION TEST")
+    print("POLLINATIONS IMAGE GENERATION TEST")
     print("=" * 45)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    drive = None
+    reference_file_id = None
+    reference_local_path = None
 
     try:
-        token, account_id = get_cloudflare_config()
-        print("Cloudflare configuration detected.")
+        drive = connect_google_drive()
+        reference_local_path = render_reference_page()
+        reference_file_id, reference_url = upload_temporary_reference(
+            drive, reference_local_path
+        )
 
-        drive_service = connect_google_drive()
-        success = generate_test_image(token, account_id)
-        if not success:
-            raise RuntimeError("Image generation failed.")
-
-        upload_image_to_drive(drive_service)
+        generate_image(reference_url)
+        upload_image_to_drive(drive)
 
         print("=" * 45)
         print("IMAGE GENERATION AND DRIVE UPLOAD TEST PASSED")
         print("=" * 45)
 
-    except HttpError as error:
+    except HttpError as exc:
         print("Google Drive HTTP request failed.")
-        print("HTTP status:", getattr(error.resp, "status", "Unknown"))
-        try:
-            raw_content = getattr(error, "content", b"")
-            if isinstance(raw_content, bytes):
-                raw_content = raw_content.decode("utf-8", errors="replace")
-            details = json.loads(raw_content)
-            print(
-                "Google Drive error details:",
-                json.dumps(details, ensure_ascii=False)[:2000],
-            )
-        except Exception:
-            print("Could not read detailed Google Drive error.")
+        print("HTTP status:", getattr(exc.resp, "status", "Unknown"))
+        print("Check Drive OAuth access, folder ID, and sharing policy.")
         sys.exit(1)
-
-    except json.JSONDecodeError:
-        print("Google OAuth configuration returned invalid JSON.")
-        sys.exit(1)
-
-    except Exception as error:
+    except Exception as exc:
         print("TEST FAILED.")
-        print("Error type:", type(error).__name__)
-        print("Error:", str(error)[:500])
+        print("Error type:", type(exc).__name__)
+        print("Error:", str(exc)[:500])
         sys.exit(1)
+    finally:
+        if drive is not None and reference_file_id:
+            delete_temporary_reference(drive, reference_file_id)
+        if reference_local_path and reference_local_path.exists():
+            try:
+                reference_local_path.unlink()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
