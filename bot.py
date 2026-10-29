@@ -5,6 +5,7 @@ import base64
 from pathlib import Path
 
 import requests
+import fitz  # PyMuPDF: reads the reference PDF already in the repository
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -22,7 +23,7 @@ OUTPUT_DIR = PROJECT_DIR / "output"
 # Existing Google Drive Output folder ID
 DRIVE_FOLDER_ID = "1tOKfM5wPPIA42gTUzVQUsgm295mzPqeJ"
 
-IMAGE_MODEL = "@cf/bytedance/stable-diffusion-xl-lightning"
+IMAGE_MODEL = "@cf/runwayml/stable-diffusion-v1-5-img2img"
 IMAGE_PATH = OUTPUT_DIR / "image_generation_test.png"
 
 CLOUDFLARE_API_URL = (
@@ -99,21 +100,69 @@ def connect_google_drive():
 # IMAGE GENERATION
 # ==========================================
 
+def load_pdf_style_reference():
+    """
+    Render the visual-reference page from the PDF in the repository.
+    The workflow expects the PDF to be at the repository root.
+    """
+    pdf_path = PROJECT_DIR / "ANIDOC MAGICAL PROMPT v4.pdf"
+    if not pdf_path.exists():
+        # Also accept a case-insensitive PDF filename, in case the repository
+        # filename has small capitalization differences.
+        candidates = [
+            path for path in PROJECT_DIR.glob("*.pdf")
+            if "anidoc" in path.name.lower() and "magical" in path.name.lower()
+        ]
+        if candidates:
+            pdf_path = candidates[0]
+        else:
+            raise RuntimeError(
+                "Could not find 'ANIDOC MAGICAL PROMPT v4.pdf' in the repository root. "
+                "Please keep the reference PDF in the same folder as bot.py."
+            )
+
+    try:
+        document = fitz.open(pdf_path)
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not open the style-reference PDF ({type(error).__name__})."
+        ) from None
+
+    if len(document) < 4:
+        document.close()
+        raise RuntimeError("The reference PDF has fewer than 4 pages.")
+
+    # Page 4 (index 3) contains the AniDoc visual-reference montage.
+    page = document[3]
+    pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+    image_bytes = pixmap.tobytes("png")
+    document.close()
+    print("Loaded style reference from:", pdf_path.name)
+    print("Reference page used: 4")
+    return image_bytes
+
+
 def generate_test_image(token, account_id):
     prompt = """
-Cinematic documentary illustration, semi-realistic 2D
-animation style, historical India in the 1940s.
+Create a NEW scene. Use the supplied image only as a visual STYLE reference;
+do not copy its characters, objects, or exact composition.
 
-An old Indian railway station at night, a steam locomotive,
-distant human silhouettes, warm lantern light and light mist.
+ANIDOC DOCUMENTARY VISUAL STYLE:
+Semi-realistic 2D documentary illustration, polished hand-drawn animation,
+clean confident outlines, realistic expressive faces and believable anatomy,
+carefully detailed clothing and environment, cinematic staging.
+Muted warm amber, khaki, dusty olive, earthy brown, and deep navy palette.
+Dramatic single-source cinematic lighting, strong but natural shadows,
+subtle atmospheric depth, serious historical-documentary mood.
+The result must look like a premium illustrated documentary frame, not a
+children's cartoon, anime, 3D render, photograph, or glossy game concept art.
 
-Historically appropriate Indian architecture and clothing.
-Detailed South Asian environment, clean outlines, muted
-warm colors, dramatic cinematic lighting, serious
-historical documentary atmosphere.
-
-Wide landscape composition, 16:9 aspect ratio.
-No text, no subtitles, no logos, no watermark.
+SCENE:
+An old Indian railway station at night in the 1940s, a steam locomotive,
+a few distant human silhouettes, warm lantern light and light mist.
+Historically plausible Indian architecture, railway details, and clothing.
+Wide cinematic landscape framing, 16:9 composition.
+No text, no subtitles, no letters, no logos, no watermark.
 """
 
     url = CLOUDFLARE_API_URL.format(
@@ -124,18 +173,26 @@ No text, no subtitles, no logos, no watermark.
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+
+    reference_bytes = load_pdf_style_reference()
     payload = {
         "prompt": prompt,
-        # Requested near-2K landscape output (16:9).
-        # If this model/account rejects these dimensions, check the API error:
-        # some model configurations may enforce a lower maximum resolution.
-        "width": 2048,
-        "height": 1152,
-        "num_steps": 4,
+        "image_b64": base64.b64encode(reference_bytes).decode("ascii"),
+        "strength": 0.78,
+        "width": 1024,
+        "height": 576,
+        "num_steps": 20,
+        "guidance": 7.5,
+        "negative_prompt": (
+            "photorealistic, 3D render, childish cartoon, anime, chibi, "
+            "oversaturated colors, glossy plastic skin, blurry, low detail, "
+            "text, captions, logo, watermark, distorted face, extra fingers"
+        ),
     }
 
     print("Image model:", IMAGE_MODEL)
-    print("Sending one image-generation request...")
+    print("Using PDF visual reference: yes")
+    print("Sending one image-to-image request...")
 
     try:
         response = requests.post(
@@ -156,9 +213,18 @@ No text, no subtitles, no logos, no watermark.
             error_data = response.json()
             for item in error_data.get("errors", [])[:3]:
                 print("API error:", str(item.get("message", "Unknown error"))[:300])
+            messages = " ".join(
+                str(item.get("message", "")) for item in error_data.get("errors", [])
+            ).lower()
         except (ValueError, AttributeError):
+            messages = ""
             print("Cloudflare returned an unexpected error response.")
 
+        if "image_b64" in messages or "image" in messages and "schema" in messages:
+            raise RuntimeError(
+                "Cloudflare rejected the reference-image input. The model API schema "
+                "may have changed; check the model's current input fields."
+            )
         if response.status_code == 401:
             raise RuntimeError("Authentication failed. Check the Cloudflare API token.")
         if response.status_code == 403:
@@ -200,11 +266,8 @@ No text, no subtitles, no logos, no watermark.
                 except (ValueError, base64.binascii.Error):
                     raise RuntimeError("Could not decode the returned image.") from None
 
-        if not image_bytes:
-            raise RuntimeError("The API response did not contain a usable image.")
-
     if not image_bytes:
-        raise RuntimeError("The generated image is empty.")
+        raise RuntimeError("The API response did not contain a usable image.")
 
     is_png = image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
     is_jpeg = image_bytes.startswith(b"\xff\xd8\xff")
