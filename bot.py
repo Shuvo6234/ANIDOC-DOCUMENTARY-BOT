@@ -126,8 +126,11 @@ No text, no subtitles, no logos, no watermark.
     }
     payload = {
         "prompt": prompt,
-        "width": 1024,
-        "height": 576,
+        # Requested near-2K landscape output (16:9).
+        # If this model/account rejects these dimensions, check the API error:
+        # some model configurations may enforce a lower maximum resolution.
+        "width": 2048,
+        "height": 1152,
         "num_steps": 4,
     }
 
