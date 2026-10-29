@@ -23,8 +23,11 @@ if not KEYS:
     sys.exit("GEMINI_API_KEYS খালি")
 
 RETRY_WORDS = ("429", "quota", "resource_exhausted", "rate", "503",
-               "unavailable", "overloaded", "deadline")
+               "unavailable", "overloaded", "deadline", "disconnected",
+               "timeout", "timed out", "remoteprotocol", "readerror",
+               "connecterror", "500", "internal")
 MODEL_GONE = ("404", "not_found", "no longer available", "not found")
+
 
 class Rotator:
     def __init__(self, keys):
@@ -33,15 +36,19 @@ class Rotator:
     def call(self, fn):
         last = None
         for _ in range(len(self.keys)):
-            client = genai.Client(api_key=self.keys[self.i])
+            client = genai.Client(
+                api_key=self.keys[self.i],
+                http_options=types.HttpOptions(timeout=300000),  # ৫ মিনিট
+            )
             try:
                 return fn(client)
             except Exception as e:
                 msg = str(e).lower()
+                print(f"Key #{self.i + 1} error: {type(e).__name__}: {str(e)[:300]}")
                 if any(w in msg for w in MODEL_GONE):
                     raise  # model সমস্যা, key বদলে লাভ নেই
-                if any(w in msg for w in RETRY_WORDS):
-                    print(f"Key #{self.i + 1} fail ({type(e).__name__}), পরের key...")
+                if any(w in msg for w in RETRY_WORDS) or "Error" in type(e).__name__:
+                    print(f"Key #{self.i + 1} fail, পরের key...")
                     last = e
                     self.i = (self.i + 1) % len(self.keys)
                     time.sleep(2)
@@ -49,7 +56,9 @@ class Rotator:
                 raise
         raise RuntimeError("সব Gemini key ব্যর্থ হয়েছে") from last
 
+
 rot = Rotator(KEYS)
+
 
 def with_models(models, fn):
     """প্রথম যে model কাজ করে সেটা সামনে এনে রাখে।"""
@@ -57,7 +66,8 @@ def with_models(models, fn):
     for m in list(models):
         try:
             result = rot.call(lambda c: fn(c, m))
-            models.remove(m); models.insert(0, m)
+            models.remove(m)
+            models.insert(0, m)
             return result
         except Exception as e:
             if any(w in str(e).lower() for w in MODEL_GONE):
@@ -67,8 +77,18 @@ def with_models(models, fn):
             raise
     raise RuntimeError("কোনো model কাজ করেনি") from last
 
+
 # ---------- 1. Script ----------
 pdf_bytes = open(PDF_PATH, "rb").read()
+
+
+def gen_text(client, model, contents):
+    out = []
+    for ch in client.models.generate_content_stream(model=model, contents=contents):
+        if ch.text:
+            out.append(ch.text)
+    return "".join(out)
+
 
 def make_script(client, model):
     prompt = (
@@ -76,14 +96,13 @@ def make_script(client, model):
         f"এই বিষয়ে পূর্ণ Hindi documentary script লেখো: {TOPIC}\n"
         "Script অবশ্যই দেবনাগরী হিন্দিতে হবে।"
     )
-    r = client.models.generate_content(
-        model=model,
-        contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
-    )
-    return r.text
+    return gen_text(client, model, [
+        types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt])
+
 
 script = with_models(TEXT_MODELS, make_script)
 print("Script তৈরি:", len(script), "chars")
+
 
 # ---------- 2. শুধু voiceover-এর text ----------
 def make_narration(client, model):
@@ -92,9 +111,11 @@ def make_narration(client, model):
         "Scene heading, timestamp, [brackets], visual/music notes, markdown চিহ্ন — সব বাদ। "
         "শুধু পরিষ্কার narration text দাও।\n\n" + script
     )
-    return client.models.generate_content(model=model, contents=prompt).text
+    return gen_text(client, model, prompt)
+
 
 narration = with_models(TEXT_MODELS, make_narration).strip()
+
 
 # ---------- 3. Voiceover ----------
 def chunks(text, limit=1200):
@@ -107,6 +128,7 @@ def chunks(text, limit=1200):
     if cur.strip():
         parts.append(cur.strip())
     return parts
+
 
 def tts(client, model, text):
     r = client.models.generate_content(
@@ -124,6 +146,7 @@ def tts(client, model, text):
     )
     return r.candidates[0].content.parts[0].inline_data.data
 
+
 pcm = b""
 for n, part in enumerate(chunks(narration), 1):
     print("Voice chunk", n)
@@ -137,7 +160,9 @@ mp3_file = f"{base}_{stamp}_voice.mp3"
 
 open(script_file, "w", encoding="utf-8").write(script)
 with wave.open(wav_file, "wb") as w:
-    w.setnchannels(1); w.setsampwidth(2); w.setframerate(24000)
+    w.setnchannels(1)
+    w.setsampwidth(2)
+    w.setframerate(24000)
     w.writeframes(pcm)
 subprocess.run(["ffmpeg", "-y", "-i", wav_file, "-b:a", "192k", mp3_file], check=True)
 
