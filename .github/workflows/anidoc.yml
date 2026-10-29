@@ -26,9 +26,9 @@ jobs:
       - name: Run bot
         env:
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
-          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
-          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
-          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.OUTPUT_FOLDER_ID }}
           TOPIC: ${{ github.event.inputs.topic }}
         run: python bot.py
