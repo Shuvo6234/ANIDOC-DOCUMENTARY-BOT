@@ -7,9 +7,15 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 PDF_PATH = "ANIDOC MAGICAL PROMPT v4.pdf"
-TEXT_MODEL = os.getenv("TEXT_MODEL", "gemini-2.5-flash")
-TTS_MODEL = os.getenv("TTS_MODEL", "gemini-2.5-flash-preview-tts")
-VOICE = os.getenv("VOICE", "Charon")  # deep male voice; Orus / Algenib ও try করতে পারো
+TEXT_MODELS = os.getenv(
+    "TEXT_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-2.5-flash"
+).split(",")
+TTS_MODELS = os.getenv(
+    "TTS_MODELS",
+    "gemini-3.8-flash-tts,gemini-3.8-flash-lite-tts,"
+    "gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts",
+).split(",")
+VOICE = os.getenv("VOICE", "Charon")  # deep male voice
 TOPIC = os.environ["TOPIC"]
 
 KEYS = [k.strip() for k in os.environ["GEMINI_API_KEYS"].split(",") if k.strip()]
@@ -18,6 +24,7 @@ if not KEYS:
 
 RETRY_WORDS = ("429", "quota", "resource_exhausted", "rate", "503",
                "unavailable", "overloaded", "deadline")
+MODEL_GONE = ("404", "not_found", "no longer available", "not found")
 
 class Rotator:
     def __init__(self, keys):
@@ -30,7 +37,10 @@ class Rotator:
             try:
                 return fn(client)
             except Exception as e:
-                if any(w in str(e).lower() for w in RETRY_WORDS):
+                msg = str(e).lower()
+                if any(w in msg for w in MODEL_GONE):
+                    raise  # model সমস্যা, key বদলে লাভ নেই
+                if any(w in msg for w in RETRY_WORDS):
                     print(f"Key #{self.i + 1} fail ({type(e).__name__}), পরের key...")
                     last = e
                     self.i = (self.i + 1) % len(self.keys)
@@ -41,34 +51,50 @@ class Rotator:
 
 rot = Rotator(KEYS)
 
+def with_models(models, fn):
+    """প্রথম যে model কাজ করে সেটা সামনে এনে রাখে।"""
+    last = None
+    for m in list(models):
+        try:
+            result = rot.call(lambda c: fn(c, m))
+            models.remove(m); models.insert(0, m)
+            return result
+        except Exception as e:
+            if any(w in str(e).lower() for w in MODEL_GONE):
+                print(f"Model {m} পাওয়া যায়নি, পরেরটা...")
+                last = e
+                continue
+            raise
+    raise RuntimeError("কোনো model কাজ করেনি") from last
+
 # ---------- 1. Script ----------
 pdf_bytes = open(PDF_PATH, "rb").read()
 
-def make_script(client):
+def make_script(client, model):
     prompt = (
         "সংযুক্ত PDF-এ ANIDOC-এর নির্দেশনা আছে। সেটা হুবহু অনুসরণ করে "
         f"এই বিষয়ে পূর্ণ Hindi documentary script লেখো: {TOPIC}\n"
         "Script অবশ্যই দেবনাগরী হিন্দিতে হবে।"
     )
     r = client.models.generate_content(
-        model=TEXT_MODEL,
+        model=model,
         contents=[types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt],
     )
     return r.text
 
-script = rot.call(make_script)
+script = with_models(TEXT_MODELS, make_script)
 print("Script তৈরি:", len(script), "chars")
 
 # ---------- 2. শুধু voiceover-এর text ----------
-def make_narration(client):
+def make_narration(client, model):
     prompt = (
         "নিচের script থেকে শুধু narrator-এর বলার লাইনগুলো বের করো, দেবনাগরী হিন্দিতে। "
         "Scene heading, timestamp, [brackets], visual/music notes, markdown চিহ্ন — সব বাদ। "
         "শুধু পরিষ্কার narration text দাও।\n\n" + script
     )
-    return client.models.generate_content(model=TEXT_MODEL, contents=prompt).text
+    return client.models.generate_content(model=model, contents=prompt).text
 
-narration = rot.call(make_narration).strip()
+narration = with_models(TEXT_MODELS, make_narration).strip()
 
 # ---------- 3. Voiceover ----------
 def chunks(text, limit=1200):
@@ -82,9 +108,9 @@ def chunks(text, limit=1200):
         parts.append(cur.strip())
     return parts
 
-def tts(client, text):
+def tts(client, model, text):
     r = client.models.generate_content(
-        model=TTS_MODEL,
+        model=model,
         contents="Read in Hindi with a deep, calm, professional male "
                  "documentary narrator voice, slow and dramatic pacing:\n" + text,
         config=types.GenerateContentConfig(
@@ -101,7 +127,7 @@ def tts(client, text):
 pcm = b""
 for n, part in enumerate(chunks(narration), 1):
     print("Voice chunk", n)
-    pcm += rot.call(lambda c, p=part: tts(c, p))
+    pcm += with_models(TTS_MODELS, lambda c, m, p=part: tts(c, m, p))
 
 stamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 base = re.sub(r"[^\w]+", "_", TOPIC)[:40] or "anidoc"
