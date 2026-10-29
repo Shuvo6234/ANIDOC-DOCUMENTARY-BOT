@@ -19,13 +19,17 @@ from googleapiclient.errors import HttpError
 PROJECT_DIR = Path(__file__).parent
 OUTPUT_DIR = PROJECT_DIR / "output"
 
+# Existing Google Drive Output folder ID
 DRIVE_FOLDER_ID = "1tOKfM5wPPIA42gTUzVQUsgm295mzPqeJ"
 
 IMAGE_MODEL = "@cf/bytedance/stable-diffusion-xl-lightning"
 
 IMAGE_PATH = OUTPUT_DIR / "image_generation_test.png"
 
-CLOUDFLARE_API_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+CLOUDFLARE_API_URL = (
+    "https://api.cloudflare.com/client/v4/accounts/"
+    "{account_id}/ai/run/{model}"
+)
 
 
 # ==========================================
@@ -158,8 +162,6 @@ No text, no subtitles, no logos, no watermark.
             response.status_code,
         )
 
-        # Print a limited error response, but never print
-        # request headers or the API token.
         try:
             error_data = response.json()
             errors = error_data.get("errors", [])
@@ -199,12 +201,9 @@ No text, no subtitles, no logos, no watermark.
 
     image_bytes = None
 
-    # Most image API responses are returned as binary image data.
     if content_type.startswith("image/"):
         image_bytes = response.content
-
     else:
-        # Also support JSON responses containing a base64 image.
         try:
             data = response.json()
         except ValueError:
@@ -247,7 +246,6 @@ No text, no subtitles, no logos, no watermark.
     if not image_bytes:
         raise RuntimeError("The generated image is empty.")
 
-    # Check that the output looks like a PNG or JPEG.
     is_png = image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
     is_jpeg = image_bytes.startswith(b"\xff\xd8\xff")
 
@@ -355,6 +353,22 @@ def main():
             "HTTP status:",
             getattr(error.resp, "status", "Unknown"),
         )
+
+        # Print Google Drive's detailed error response.
+        # This does not print credentials or API tokens.
+        try:
+            raw_content = getattr(error, "content", b"")
+            if isinstance(raw_content, bytes):
+                raw_content = raw_content.decode("utf-8", errors="replace")
+
+            details = json.loads(raw_content)
+            print(
+                "Google Drive error details:",
+                json.dumps(details, ensure_ascii=False)[:2000],
+            )
+        except Exception:
+            print("Could not read detailed Google Drive error.")
+
         sys.exit(1)
 
     except json.JSONDecodeError:
