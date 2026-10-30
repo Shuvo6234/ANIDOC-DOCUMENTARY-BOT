@@ -865,13 +865,51 @@ def build_groups(media, info, mapping, n_scenes):
 ENC = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", str(FPS)]
 
 
-def make_clip(src, is_video, frames, out, variant, fade_in=False, fade_out=False):
+def _screen_caption(narration):
+    """Narration থেকে ছোট English documentary caption; year/number-কে অগ্রাধিকার।"""
+    t = str(narration)
+    year = re.search(r"\b(1[0-9]{3}|20[0-9]{2})\b", t)
+    if year:
+        return year.group(1) + "  |  A TURNING POINT IN HISTORY"
+    # Hindi narration-এ কিছু পরিচিত cue; না পেলে concise neutral caption.
+    rules = [
+        (r"युद्ध|जंग|युद्धभूमि|लड़ाई", "THE BATTLE BEGINS"),
+        (r"इतिहास|ऐतिहासिक", "A MOMENT IN HISTORY"),
+        (r"साम्राज्य|राजा|शासक", "RISE OF AN EMPIRE"),
+        (r"मृत्यु|मौत|शहादत", "THE HUMAN COST"),
+        (r"आजादी|स्वतंत्रता", "THE FIGHT FOR FREEDOM"),
+    ]
+    for pattern, caption in rules:
+        if re.search(pattern, t, re.I):
+            return caption
+    words = re.findall(r"[A-Za-z0-9]+", t)
+    if words:
+        return " ".join(words[:6]).upper()[:52]
+    return "THE STORY UNFOLDS"
+
+
+def _drawtext_escape(value):
+    return (str(value).replace("\\", r"\\\\").replace(":", r"\\:")
+            .replace("'", r"\\'").replace("%", r"\\%"))
+
+
+def make_clip(src, is_video, frames, out, variant, fade_in=False, fade_out=False, overlay_text=""):
+
     dur = frames / FPS
     fx = []
     if fade_in:
         fx.append("fade=t=in:st=0:d=0.8")
     if fade_out:
         fx.append(f"fade=t=out:st={max(dur - 1.5, 0):.2f}:d=1.5")
+    # Drawtext creates a restrained premium lower-third; font is installed by workflow.
+    if overlay_text and os.getenv("PREMIUM_TEXT", "1") == "1":
+        txt = _drawtext_escape(overlay_text[:64])
+        fx.append(
+            "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+            f"text='{txt}':fontcolor=white:fontsize=h*0.035:borderw=2:bordercolor=black@0.75:"
+            "box=1:boxcolor=black@0.28:boxborderw=18:x=(w-text_w)/2:y=h*0.82:"
+            "enable='between(t,0.35,4.8)'"
+        )
     fxs = ("," + ",".join(fx)) if fx else ""
     if is_video:
         vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS},setsar=1{fxs}"
@@ -974,23 +1012,71 @@ def make_bgm(dur, files):
     return "bgm_full.wav"
 
 
-def final_mix(total, bgm):
-    """voice-কে পরিষ্কার করে, music duck করে, mix করে YouTube loudness-এ আনে।"""
+def make_sfx_track(scene_durations, out="sfx_track.wav"):
+    """Generate subtle royalty-free synthetic transition accents locally with FFmpeg."""
+    inputs, filters, labels = [], [], []
+    cursor = 0.0
+    for i, duration in enumerate(scene_durations):
+        # restrained whoosh on each scene change; every third change gets a soft low impact
+        if i > 0:
+            at = max(0.0, cursor - 0.18)
+            inputs += ["-f", "lavfi", "-i",
+                       "anoisesrc=color=pink:sample_rate=44100:duration=0.75"]
+            idx = len(labels)
+            filters.append(
+                f"[{idx}:a]highpass=f=500,lowpass=f=7000,afade=t=in:d=0.08,"
+                f"afade=t=out:st=0.25:d=0.5,volume=0.10,adelay={int(at*1000)}|{int(at*1000)}[s{idx}]"
+            )
+            labels.append(f"[s{idx}]")
+            if i % 3 == 0:
+                inputs += ["-f", "lavfi", "-i",
+                           "sine=frequency=58:sample_rate=44100:duration=0.65"]
+                idx = len(labels)
+                filters.append(
+                    f"[{idx}:a]aecho=0.8:0.7:80|160:0.35|0.18,"
+                    f"afade=t=out:st=0.12:d=0.5,volume=0.12,adelay={int(at*1000)}|{int(at*1000)}[s{idx}]"
+                )
+                labels.append(f"[s{idx}]")
+        cursor += duration
+    if not labels:
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i",
+                        f"anullsrc=r=44100:cl=stereo:d={sum(scene_durations):.2f}",
+                        "-c:a", "pcm_s16le", out], check=True, capture_output=True)
+        return out
+    filters.append("".join(labels) + f"amix=inputs={len(labels)}:duration=longest:normalize=0,"
+                   f"atrim=0:{sum(scene_durations):.2f},volume=0.65[out]")
+    cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", ";".join(filters),
+           "-map", "[out]", "-ar", "44100", "-ac", "2", out]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return out
+
+
+def final_mix(total, bgm, sfx="sfx_track.wav"):
+    """Clear narration + sidechain-ducked score + restrained scene-transition SFX."""
+    has_sfx = os.path.exists(sfx)
+    inputs = ["ffmpeg", "-y", "-i", "video_noaudio.mp4", "-i", "voice.wav", "-i", bgm]
+    if has_sfx:
+        inputs += ["-i", sfx]
     fc = (
-        # voice: low-cut + হালকা compression
-        "[1:a]highpass=f=70,acompressor=threshold=-20dB:ratio=3:attack=10:release=150,"
+        "[1:a]highpass=f=75,lowpass=f=15000,"
+        "acompressor=threshold=-20dB:ratio=3:attack=10:release=150:makeup=2,"
         "aformat=sample_rates=44100:channel_layouts=stereo,asplit=2[v1][v2];"
-        # music: ভলিউম + voice-এর frequency-তে জায়গা ছাড়া
-        f"[2:a]volume={BGM_VOL},equalizer=f=1500:t=q:w=1:g=-4,"
+        f"[2:a]volume={BGM_VOL},equalizer=f=1800:t=q:w=1:g=-4,"
         "aformat=sample_rates=44100:channel_layouts=stereo[m];"
-        # voice বললে music আপনা-আপনি নিচে নামে, বিরতিতে আবার ওঠে
-        "[m][v2]sidechaincompress=threshold=0.02:ratio=6:attack=30:release=600[duck];"
-        "[v1][duck]amix=inputs=2:duration=first:normalize=0,"
-        f"loudnorm=I={LUFS}:TP=-1.5:LRA=9,afade=t=out:st={max(total - 2, 0):.2f}:d=2[a]")
-    subprocess.run(["ffmpeg", "-y", "-i", "video_noaudio.mp4", "-i", "voice.wav", "-i", bgm,
-                    "-filter_complex", fc, "-map", "0:v", "-map", "[a]",
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest",
-                    "-movflags", "+faststart", "final_video.mp4"], check=True, capture_output=True)
+        "[m][v2]sidechaincompress=threshold=0.025:ratio=7:attack=25:release=650[duck];"
+    )
+    if has_sfx:
+        fc += ("[3:a]volume=0.55,highpass=f=120,lowpass=f=9000,"
+               "aformat=sample_rates=44100:channel_layouts=stereo[sfx];"
+               "[v1][duck][sfx]amix=inputs=3:duration=first:normalize=0,"
+               f"loudnorm=I={LUFS}:TP=-1.5:LRA=9,afade=t=out:st={max(total-2,0):.2f}:d=2[a]")
+    else:
+        fc += ("[v1][duck]amix=inputs=2:duration=first:normalize=0,"
+               f"loudnorm=I={LUFS}:TP=-1.5:LRA=9,afade=t=out:st={max(total-2,0):.2f}:d=2[a]")
+    inputs += ["-filter_complex", fc, "-map", "0:v", "-map", "[a]",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest",
+               "-movflags", "+faststart", "final_video.mp4"]
+    subprocess.run(inputs, check=True, capture_output=True)
 
 
 def run_video():
@@ -1084,9 +1170,11 @@ def run_video():
         for j, inf in enumerate(grp):
             part = max(frames // k + (1 if j < frames % k else 0), 12)
             out = f"clips/c{gi:05d}.mp4"
+            caption = _screen_caption(scenes[si].get("narration", "")) if j == 0 else ""
             make_clip(inf["path"], inf["video"], part, out, variant=gi,
                       fade_in=(gi == 0),
-                      fade_out=(si == n_total_scenes - 1 and j == k - 1))
+                      fade_out=(si == n_total_scenes - 1 and j == k - 1),
+                      overlay_text=caption)
             clip_files.append(out)
             gi += 1
         if (si + 1) % 5 == 0 or si + 1 == n_total_scenes:
@@ -1102,7 +1190,9 @@ def run_video():
     subprocess.run(["ffmpeg", "-y", "-i", "voice.wav", "-af", "loudnorm=I=-16:TP=-1.5:LRA=7",
                     "-b:a", "192k", "voiceover.mp3"], check=True, capture_output=True)
     bgm = make_bgm(total + 1, files)
-    final_mix(total, bgm)
+    sfx_track = make_sfx_track(durs)
+    print("Premium overlays: English lower-thirds; transition SFX track generated")
+    final_mix(total, bgm, sfx_track)
     subprocess.run(["ffmpeg", "-y", "-i", bgm, "-b:a", "192k", "background_music.mp3"],
                    check=True, capture_output=True)
 
