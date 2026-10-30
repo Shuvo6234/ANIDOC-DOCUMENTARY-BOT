@@ -8,7 +8,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 # log সঙ্গে সঙ্গে দেখানোর জন্য (GitHub Actions-এ নইলে output আটকে থাকে)
 sys.stdout.reconfigure(line_buffering=True)
-MAX_RUN_MIN = int(os.getenv("MAX_RUN_MIN", "45"))
+MAX_RUN_MIN = int(os.getenv("MAX_RUN_MIN", "170"))
 
 
 def _watchdog():
@@ -120,47 +120,100 @@ def d_delete(fid):
     drive.files().delete(fileId=fid).execute()
 
 
-# ---------- Gemini key rotation ----------
+# ---------- Gemini key scheduler (এই runner-এর সব thread-এর মধ্যে shared) ----------
 class Rotator:
+    """প্রতি key-তে এক সময়ে একটি request; 429 হলে cooldown, invalid হলে disable.
+
+    একই Python process-এর concurrent worker-দের মধ্যে BUSY/FREE অবস্থা thread-safe।
+    আলাদা GitHub runner/process-এর মধ্যে lock ভাগ হয় না; তার জন্য external transactional
+    lock service (যেমন Firestore) দরকার।
+    """
     def __init__(self, keys):
-        self.keys = list(enumerate(keys, 1))
-        self.i = 0
+        self.keys = [
+            {"no": i, "key": key, "state": "FREE", "until": 0.0, "last_error": ""}
+            for i, key in enumerate(keys, 1)
+        ]
+        self.cv = threading.Condition()
+        self.cursor = 0
+
+    def _acquire(self):
+        with self.cv:
+            while True:
+                now = time.monotonic()
+                available = [x for x in self.keys if x["state"] == "FREE" or
+                             (x["state"] == "COOLDOWN" and x["until"] <= now)]
+                if available:
+                    # round-robin, যাতে সব key সমানভাবে ব্যবহৃত হয়
+                    available.sort(key=lambda x: ((x["no"] - 1 - self.cursor) % max(len(self.keys), 1)))
+                    item = available[0]
+                    item["state"] = "BUSY"
+                    self.cursor = item["no"] % max(len(self.keys), 1)
+                    return item
+                usable = [x for x in self.keys if x["state"] != "DISABLED"]
+                if not usable:
+                    raise RuntimeError("সব Gemini API key invalid/disabled")
+                cooldowns = [x["until"] for x in usable if x["state"] == "COOLDOWN"]
+                if cooldowns:
+                    wait = max(0.2, min(30.0, min(cooldowns) - now))
+                    print(f"সব Gemini key BUSY/COOLDOWN; {wait:.1f}s অপেক্ষা...")
+                    self.cv.wait(timeout=wait)
+                else:
+                    # অন্য thread-এর BUSY key শেষ হওয়া পর্যন্ত অপেক্ষা
+                    self.cv.wait(timeout=30)
+
+    def _release(self, item, state="FREE", cooldown=0, error=""):
+        with self.cv:
+            item["state"] = state
+            item["until"] = time.monotonic() + cooldown if state == "COOLDOWN" else 0.0
+            item["last_error"] = error[:300]
+            self.cv.notify_all()
+
+    @staticmethod
+    def _cooldown_seconds(msg):
+        # API error text-এ retry delay থাকলে সেটি ধরার চেষ্টা
+        import re
+        m = re.search(r"retry(?:\s+in|after)[^0-9]{0,12}(\d+(?:\.\d+)?)\s*s", msg, re.I)
+        if m:
+            return max(5.0, min(float(m.group(1)) + 2.0, 900.0))
+        if "429" in msg or "quota" in msg or "resource_exhausted" in msg or "rate" in msg:
+            return float(os.getenv("GEMINI_QUOTA_COOLDOWN_SEC", "60"))
+        return float(os.getenv("GEMINI_TRANSIENT_COOLDOWN_SEC", "15"))
 
     def call(self, fn, rounds=int(os.getenv("GEMINI_ROUNDS", "3"))):
         last = None
-        for rnd in range(1, rounds + 1):
-            tried = 0
-            while self.keys and tried < len(self.keys):
-                self.i %= len(self.keys)
-                no, key = self.keys[self.i]
+        max_attempts = max(1, rounds) * max(1, len(self.keys))
+        for attempt in range(max_attempts):
+            item = self._acquire()
+            no, key = item["no"], item["key"]
+            print(f"→ Gemini call, key {no}/{len(self.keys)} [BUSY]")
+            try:
                 client = genai.Client(
-                    api_key=key, http_options=types.HttpOptions(timeout=int(os.getenv("GEMINI_TIMEOUT_MS", "120000"))))
-                print(f"→ Gemini call, key {no}/{TOTAL}, round {rnd}")
-                try:
-                    return fn(client)
-                except Exception as e:
-                    msg = str(e).lower()
-                    print(f"[round {rnd}] Key {no}/{TOTAL}: {type(e).__name__}: {str(e)[:120]}")
-                    if any(w in msg for w in MODEL_GONE):
-                        raise
-                    if any(w in msg for w in KEY_DEAD):
-                        print(f"Key {no} বাদ (permission/billing সমস্যা)")
-                        self.keys.pop(self.i)
-                        last = e
-                        continue
-                    if any(w in msg for w in RETRY_WORDS):
-                        last = e
-                        self.i += 1
-                        tried += 1
-                        time.sleep(2)
-                        continue
+                    api_key=key,
+                    http_options=types.HttpOptions(timeout=int(os.getenv("GEMINI_TIMEOUT_MS", "120000")))
+                )
+                result = fn(client)
+                self._release(item, "FREE")
+                print(f"✓ Gemini key {no} FREE")
+                return result
+            except Exception as e:
+                msg = str(e).lower()
+                last = e
+                print(f"[key {no}] {type(e).__name__}: {str(e)[:160]}")
+                if any(w in msg for w in MODEL_GONE):
+                    self._release(item, "FREE", error=msg)
                     raise
-            if not self.keys:
-                break
-            wait = min(30 * rnd, 120)
-            print(f"সব key এখন ব্যস্ত, {wait} সেকেন্ড অপেক্ষা করে আবার চেষ্টা...")
-            time.sleep(wait)
-        raise RuntimeError("সব Gemini key ব্যর্থ হয়েছে") from last
+                if any(w in msg for w in KEY_DEAD):
+                    self._release(item, "DISABLED", error=msg)
+                    print(f"Key {no} DISABLED (invalid/permission সমস্যা)")
+                    continue
+                if any(w in msg for w in RETRY_WORDS):
+                    delay = self._cooldown_seconds(msg)
+                    self._release(item, "COOLDOWN", cooldown=delay, error=msg)
+                    print(f"Key {no} COOLDOWN {delay:.0f}s; অন্য FREE key চেষ্টা হবে")
+                    continue
+                self._release(item, "FREE", error=msg)
+                raise
+        raise RuntimeError("Gemini-এর সব key-এ retry শেষ; কাজ অসম্পূর্ণ") from last
 
 
 rot = Rotator(KEYS)
