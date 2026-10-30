@@ -121,6 +121,10 @@ def d_delete(fid):
 
 
 # ---------- Gemini key scheduler (এই runner-এর সব thread-এর মধ্যে shared) ----------
+class AllGeminiKeysExhausted(RuntimeError):
+    """সব configured key-এর quota শেষ; retry না করে run বন্ধ করতে হবে।"""
+
+
 class Rotator:
     """প্রতি key-তে এক সময়ে একটি request; 429 হলে cooldown, invalid হলে disable.
 
@@ -149,8 +153,14 @@ class Rotator:
                     item["state"] = "BUSY"
                     self.cursor = item["no"] % max(len(self.keys), 1)
                     return item
-                usable = [x for x in self.keys if x["state"] != "DISABLED"]
+                usable = [x for x in self.keys if x["state"] not in ("DISABLED", "EXHAUSTED")]
                 if not usable:
+                    exhausted = sum(x["state"] == "EXHAUSTED" for x in self.keys)
+                    if exhausted:
+                        raise AllGeminiKeysExhausted(
+                            f"সব {exhausted}/{len(self.keys)}টি Gemini key-এর quota শেষ। "
+                            "আর retry করা হবে না; quota reset/billing ঠিক করে আবার চালান।"
+                        )
                     raise RuntimeError("সব Gemini API key invalid/disabled")
                 cooldowns = [x["until"] for x in usable if x["state"] == "COOLDOWN"]
                 if cooldowns:
@@ -179,8 +189,23 @@ class Rotator:
             return float(os.getenv("GEMINI_QUOTA_COOLDOWN_SEC", "60"))
         return float(os.getenv("GEMINI_TRANSIENT_COOLDOWN_SEC", "15"))
 
+    @staticmethod
+    def _is_hard_quota_exhaustion(msg):
+        """Daily/plan quota exhaustion স্থায়ীভাবে mark করে; RPM/temporary 429 নয়।"""
+        hard_markers = (
+            "you exceeded your current quota",
+            "quota exceeded",
+            "daily quota",
+            "per day limit",
+            "requests per day",
+            "check your plan and billing details",
+            "billing details",
+        )
+        return any(marker in msg for marker in hard_markers)
+
     def call(self, fn, rounds=int(os.getenv("GEMINI_ROUNDS", "3"))):
         last = None
+        # প্রতিটি key একবার করে পরীক্ষা; স্থায়ী quota exhaustion হলে সেটি আর retry নয়।
         max_attempts = max(1, rounds) * max(1, len(self.keys))
         for attempt in range(max_attempts):
             item = self._acquire()
@@ -206,6 +231,16 @@ class Rotator:
                     self._release(item, "DISABLED", error=msg)
                     print(f"Key {no} DISABLED (invalid/permission সমস্যা)")
                     continue
+                if self._is_hard_quota_exhaustion(msg):
+                    self._release(item, "EXHAUSTED", error=msg)
+                    exhausted = sum(x["state"] == "EXHAUSTED" for x in self.keys)
+                    print(f"Key {no} QUOTA-EXHAUSTED ({exhausted}/{len(self.keys)}); এই run-এ আর ব্যবহার হবে না")
+                    if exhausted == len(self.keys):
+                        raise AllGeminiKeysExhausted(
+                            f"সব {len(self.keys)}টি Gemini API key-এর quota শেষ। "
+                            "Bot বন্ধ করা হচ্ছে—আর কোনো retry হবে না।"
+                        ) from e
+                    continue
                 if any(w in msg for w in RETRY_WORDS):
                     delay = self._cooldown_seconds(msg)
                     self._release(item, "COOLDOWN", cooldown=delay, error=msg)
@@ -213,6 +248,11 @@ class Rotator:
                     continue
                 self._release(item, "FREE", error=msg)
                 raise
+        exhausted = sum(x["state"] == "EXHAUSTED" for x in self.keys)
+        if exhausted == len(self.keys):
+            raise AllGeminiKeysExhausted(
+                f"সব {len(self.keys)}টি Gemini API key-এর quota শেষ। Bot বন্ধ করা হচ্ছে।"
+            ) from last
         raise RuntimeError("Gemini-এর সব key-এ retry শেষ; কাজ অসম্পূর্ণ") from last
 
 
@@ -1082,3 +1122,71 @@ if MODE == "video":
     run_video()
 else:
     run_prompts()
+2. GitHub Actions workflow
+name: ANIDOC Hindi Documentary
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "prompts = script + image prompts | video = audio + final mp4"
+        type: choice
+        options:
+          - prompts
+          - video
+        default: prompts
+      topic:
+        description: "Documentary topic (prompts mode-এ লাগবে)"
+        required: false
+      project:
+        description: "Drive project folder-এর নাম (video mode; ফাঁকা = সর্বশেষটা)"
+        required: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Run bot
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+          TOPIC: ${{ github.event.inputs.topic }}
+          PROJECT: ${{ github.event.inputs.project }}
+          MAX_RUN_MIN: "170"
+          GEMINI_QUOTA_COOLDOWN_SEC: "60"
+          GEMINI_TRANSIENT_COOLDOWN_SEC: "15"
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.OUTPUT_FOLDER_ID }}
+        run: python bot.py
+
+      - name: Save backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anidoc-output-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            script.txt
+            image_prompts.txt
+            youtube_package.txt
+            scenes.json
+            image_map.json
+            voiceover.mp3
+            background_music.mp3
+            final_video.mp4
