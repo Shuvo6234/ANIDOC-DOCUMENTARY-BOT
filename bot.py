@@ -98,6 +98,13 @@ def with_models(models, fn):
     raise RuntimeError("কোনো model কাজ করেনি") from last
 
 
+def strip_tags(t):
+    """<...> audio tag মুছে ফেলে, বাড়তি space ঠিক করে।"""
+    t = re.sub(r"<[^<>\n]{1,40}>", "", t)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t
+
+
 # ---------- 1. Script ----------
 pdf_bytes = open(PDF_PATH, "rb").read()
 
@@ -111,15 +118,9 @@ LANG_RULE = (
     "প্রয়োজন মতো English শব্দ মেশাও।"
 )
 
-TAG_RULE = (
-    "Audio tag-এর নিয়ম: narrator-এর বলার লাইনের ভেতরে এই inline audio tag-গুলো বসাও, "
-    "ঠিক এই বানানে, angle bracket-এ, English-এ (অনুবাদ করবে না): "
-    "<short pause> — বাক্যের মাঝে বা কমার পরে ছোট বিরতি; "
-    "<long pause> — বড় অংশ বা দৃশ্য বদলের আগে-পরে এবং নাটকীয় মুহূর্তে; "
-    "<breath> — লম্বা বাক্য শুরুর আগে, খুব কম; "
-    "<sigh> — ভারী বা দুঃখের মুহূর্তে, খুব কম। "
-    "প্রতি ১০০ শব্দে সর্বোচ্চ ৩-৫টা tag। দুটো tag পরপর বসাবে না। "
-    "এই চারটা ছাড়া অন্য কোনো tag বা [ ] দিয়ে ধ্বনি/music/scene নির্দেশ লিখবে না।"
+NO_TAG_RULE = (
+    "Script-এ কোনো audio tag, sound/music নির্দেশ বা < > দিয়ে লেখা কিছু রাখবে না। "
+    "বিরতি বোঝাতে শুধু দাঁড়ি (।), কমা আর ... ব্যবহার করো।"
 )
 
 
@@ -134,13 +135,13 @@ def gen_text(client, model, contents):
 def make_script(client, model):
     prompt = (
         "সংযুক্ত PDF-এ ANIDOC-এর নির্দেশনা আছে। সেটা অনুসরণ করে "
-        f"এই বিষয়ে পূর্ণ documentary script লেখো: {TOPIC}\n\n" + LANG_RULE + "\n\n" + TAG_RULE
+        f"এই বিষয়ে পূর্ণ documentary script লেখো: {TOPIC}\n\n" + LANG_RULE + "\n\n" + NO_TAG_RULE
     )
     return gen_text(client, model, [
         types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt])
 
 
-script = with_models(TEXT_MODELS, make_script)
+script = strip_tags(with_models(TEXT_MODELS, make_script))
 print("Script তৈরি:", len(script), "chars")
 
 
@@ -148,8 +149,8 @@ print("Script তৈরি:", len(script), "chars")
 def make_narration(client, model):
     prompt = (
         "নিচের script থেকে শুধু narrator-এর বলার লাইনগুলো বের করো। "
-        "Scene heading, timestamp, [ ] দিয়ে লেখা নির্দেশ, visual/music notes, markdown চিহ্ন — সব বাদ। "
-        "কিন্তু <short pause>, <long pause>, <breath>, <sigh> tag-গুলো যেমন আছে হুবহু রেখে দাও। "
+        "Scene heading, timestamp, [ ] বা < > দিয়ে লেখা নির্দেশ, visual/music notes, "
+        "markdown চিহ্ন — সব বাদ। "
         "হিন্দি শব্দ দেবনাগরী লিপিতেই থাকবে, English শব্দ English অক্ষরেই থাকবে। "
         "প্রতিটা বাক্য শেষে দাঁড়ি (।) বা full stop দাও। "
         "শুধু পরিষ্কার narration text দাও, আর কিছু না।\n\n" + script
@@ -157,20 +158,11 @@ def make_narration(client, model):
     return gen_text(client, model, prompt)
 
 
-ALLOWED_TAGS = {"short pause", "long pause", "breath", "sigh"}
-
-
-def clean_tags(t):
-    def fix(m):
-        tag = " ".join(m.group(1).lower().split())
-        return f"<{tag}>" if tag in ALLOWED_TAGS else ""
-    return re.sub(r"<([^<>]+)>", fix, t)
-
-
 narration = with_models(TEXT_MODELS, make_narration).strip()
-narration = re.sub(r"[*#_`]+", "", narration)  # '<' '>' মুছবে না, tag দরকার
-narration = clean_tags(narration)
-print("Narration:", len(narration), "chars, tag:", len(re.findall(r"<[^<>]+>", narration)))
+narration = re.sub(r"[*#_`]+", "", narration)
+narration = re.sub(r"\[[^\]\n]{1,60}\]", "", narration)  # [ ] নির্দেশ
+narration = strip_tags(narration).strip()
+print("Narration:", len(narration), "chars")
 
 # ---------- 3. Voiceover ----------
 # ছোট, স্থির style — প্রতিটা call-এ হুবহু একই
@@ -209,11 +201,10 @@ def tts(client, model, text):
                 print("SDK নতুন schema বোঝেনি, legacy format-এ চেষ্টা...")
             else:
                 raise
-    legacy = re.sub(r"<([^<>]+)>", r"[\1]", text)  # পুরনো model-এ [tag]
     prefix = "" if model.startswith("gemini-3.8") else LEGACY_PREFIX
     r = client.models.generate_content(
         model=model,
-        contents=prefix + legacy,
+        contents=prefix + text,
         config=types.GenerateContentConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
@@ -255,7 +246,7 @@ def active_seconds(pcm, thr=300):
 
 
 def speech_chars(text):
-    return len(re.sub(r"<[^<>]+>|\s+", "", text))
+    return len(re.sub(r"\s+", "", text))
 
 
 def change_tempo(pcm, factor):
