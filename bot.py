@@ -455,7 +455,8 @@ def match_media(files, scenes):
     os.makedirs("media", exist_ok=True)
     info = {}
     for f in media:
-        p = os.path.join("media", f"{f['id'][:8]}_{re.sub(r'[^\w.]+', '_', f['name'])}")
+        safe = re.sub(r"[^\w.]+", "_", f["name"])
+        p = os.path.join("media", f"{f['id'][:8]}_{safe}")
         d_download(f["id"], p)
         info[f["id"]] = {"name": f["name"], "path": p,
                          "video": f["name"].lower().endswith(VID_EXT)}
