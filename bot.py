@@ -1,4 +1,4 @@
-import os, re, sys, wave, time, datetime, subprocess, audioop
+import os, re, io, sys, wave, time, datetime, subprocess, audioop, statistics
 from google import genai
 from google.genai import types
 from google.oauth2.credentials import Credentials
@@ -13,9 +13,9 @@ TEXT_MODELS = os.getenv(
 TTS_MODELS = os.getenv(
     "TTS_MODELS",
     "gemini-3.8-flash-tts,gemini-3.8-flash-lite-tts,"
-    "gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts",
+    "gemini-3.1-flash-tts-preview,gemini-2.5-pro-preview-tts",
 ).split(",")
-VOICE = os.getenv("VOICE", "Charon")  # deep male voice (Orus / Algenib-ও try করতে পারো)
+VOICE = os.getenv("VOICE", "Charon")  # Charon / Rasalgethi = Informative, Algenib = Gravelly
 TOPIC = os.environ["TOPIC"]
 
 KEYS = [k.strip() for k in os.environ["GEMINI_API_KEYS"].split(",") if k.strip()]
@@ -29,7 +29,7 @@ RETRY_WORDS = ("429", "quota", "resource_exhausted", "rate", "503",
 MODEL_GONE = ("404", "not_found", "no longer available", "not found")
 KEY_DEAD = ("permission_denied", "api key not valid", "api_key_invalid")
 
-# ---------- 0. Drive আগে check (অনেকক্ষণ কাজ করার পর fail এড়াতে) ----------
+# ---------- 0. Drive আগে check ----------
 creds = Credentials(
     None,
     refresh_token=os.environ["GDRIVE_REFRESH_TOKEN"],
@@ -87,7 +87,7 @@ def with_models(models, fn):
         try:
             result = rot.call(lambda c: fn(c, m))
             models.remove(m)
-            models.insert(0, m)  # যেটা কাজ করল সেটাই পরে ব্যবহার হবে
+            models.insert(0, m)
             return result
         except Exception as e:
             if any(w in str(e).lower() for w in MODEL_GONE):
@@ -111,6 +111,17 @@ LANG_RULE = (
     "প্রয়োজন মতো English শব্দ মেশাও।"
 )
 
+TAG_RULE = (
+    "Audio tag-এর নিয়ম: narrator-এর বলার লাইনের ভেতরে এই inline audio tag-গুলো বসাও, "
+    "ঠিক এই বানানে, angle bracket-এ, English-এ (অনুবাদ করবে না): "
+    "<short pause> — বাক্যের মাঝে বা কমার পরে ছোট বিরতি; "
+    "<long pause> — বড় অংশ বা দৃশ্য বদলের আগে-পরে এবং নাটকীয় মুহূর্তে; "
+    "<breath> — লম্বা বাক্য শুরুর আগে, খুব কম; "
+    "<sigh> — ভারী বা দুঃখের মুহূর্তে, খুব কম। "
+    "প্রতি ১০০ শব্দে সর্বোচ্চ ৩-৫টা tag। দুটো tag পরপর বসাবে না। "
+    "এই চারটা ছাড়া অন্য কোনো tag বা [ ] দিয়ে ধ্বনি/music/scene নির্দেশ লিখবে না।"
+)
+
 
 def gen_text(client, model, contents):
     out = []
@@ -123,7 +134,7 @@ def gen_text(client, model, contents):
 def make_script(client, model):
     prompt = (
         "সংযুক্ত PDF-এ ANIDOC-এর নির্দেশনা আছে। সেটা অনুসরণ করে "
-        f"এই বিষয়ে পূর্ণ documentary script লেখো: {TOPIC}\n\n" + LANG_RULE
+        f"এই বিষয়ে পূর্ণ documentary script লেখো: {TOPIC}\n\n" + LANG_RULE + "\n\n" + TAG_RULE
     )
     return gen_text(client, model, [
         types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"), prompt])
@@ -137,33 +148,85 @@ print("Script তৈরি:", len(script), "chars")
 def make_narration(client, model):
     prompt = (
         "নিচের script থেকে শুধু narrator-এর বলার লাইনগুলো বের করো। "
-        "Scene heading, timestamp, [brackets], visual/music notes, markdown চিহ্ন (*, #, -) — সব বাদ। "
-        "হিন্দি শব্দ দেবনাগরী লিপিতেই থাকবে, কখনো রোমান অক্ষরে নয়। English শব্দ English "
-        "অক্ষরেই থাকবে, দেবনাগরীতে বদলাবে না। প্রতিটা বাক্য শেষে দাঁড়ি (।) বা full stop দাও। "
+        "Scene heading, timestamp, [ ] দিয়ে লেখা নির্দেশ, visual/music notes, markdown চিহ্ন — সব বাদ। "
+        "কিন্তু <short pause>, <long pause>, <breath>, <sigh> tag-গুলো যেমন আছে হুবহু রেখে দাও। "
+        "হিন্দি শব্দ দেবনাগরী লিপিতেই থাকবে, English শব্দ English অক্ষরেই থাকবে। "
+        "প্রতিটা বাক্য শেষে দাঁড়ি (।) বা full stop দাও। "
         "শুধু পরিষ্কার narration text দাও, আর কিছু না।\n\n" + script
     )
     return gen_text(client, model, prompt)
 
 
-narration = with_models(TEXT_MODELS, make_narration).strip()
-narration = re.sub(r"[*#_`>]+", "", narration)
+ALLOWED_TAGS = {"short pause", "long pause", "breath", "sigh"}
 
+
+def clean_tags(t):
+    def fix(m):
+        tag = " ".join(m.group(1).lower().split())
+        return f"<{tag}>" if tag in ALLOWED_TAGS else ""
+    return re.sub(r"<([^<>]+)>", fix, t)
+
+
+narration = with_models(TEXT_MODELS, make_narration).strip()
+narration = re.sub(r"[*#_`]+", "", narration)  # '<' '>' মুছবে না, tag দরকার
+narration = clean_tags(narration)
+print("Narration:", len(narration), "chars, tag:", len(re.findall(r"<[^<>]+>", narration)))
 
 # ---------- 3. Voiceover ----------
-STYLE = (
-    "You are the narrator of a premium Hindi documentary, in the style of "
-    "Discovery or National Geographic India. Voice: a deep, warm, authoritative adult male. "
-    "Pitch: low and steady. Pace: slow to medium, about 130 words per minute. "
-    "Tone: serious, calm and cinematic, with gentle emphasis on key words and natural pauses "
-    "at commas and full stops. Keep exactly the same voice, pitch, energy, loudness and pace "
-    "from start to finish. Never become cheerful, rushed, whispery or theatrical. "
-    "The text is Hindi in Devanagari script with some English words in Latin script. "
-    "Pronounce Hindi words in clear standard Hindi and English words in a natural Indian accent. "
-    "Read only the text after the colon, do not read these instructions.\nText: "
+# ছোট, স্থির style — প্রতিটা call-এ হুবহু একই
+STYLE = ("calm, deep and authoritative documentary narrator, "
+         "speaking slowly at a steady, measured pace with a serious cinematic tone")
+LEGACY_PREFIX = (
+    "Read the following text aloud as a deep, calm, authoritative documentary narrator, "
+    "slow and steady pace, serious tone. Do not read these instructions:\n"
 )
 
 
-def chunks(text, limit=2200):
+def to_pcm(data):
+    """3.8 model WAV (header-সহ) দেয়, পুরনো model raw PCM দেয় — দুটোই সামলাই।"""
+    if data[:4] == b"RIFF":
+        with wave.open(io.BytesIO(data), "rb") as w:
+            return w.readframes(w.getnframes())
+    return data
+
+
+def tts(client, model, text):
+    if model.startswith("gemini-3.8"):
+        try:
+            r = client.models.generate_content(
+                model=model,
+                contents=[{"role": "user", "parts": [
+                    {"text": text, "speech_metadata": {"style": STYLE}}]}],
+                config={
+                    "response_modalities": ["AUDIO"],
+                    "speech_config": {"voice_config": {"voice": VOICE}},
+                },
+            )
+            return to_pcm(r.candidates[0].content.parts[0].inline_data.data)
+        except Exception as e:
+            if any(w in str(e).lower() for w in
+                   ("validation", "extra_forbidden", "speech_metadata", "voice_config", "unexpected")):
+                print("SDK নতুন schema বোঝেনি, legacy format-এ চেষ্টা...")
+            else:
+                raise
+    legacy = re.sub(r"<([^<>]+)>", r"[\1]", text)  # পুরনো model-এ [tag]
+    prefix = "" if model.startswith("gemini-3.8") else LEGACY_PREFIX
+    r = client.models.generate_content(
+        model=model,
+        contents=prefix + legacy,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE)
+                )
+            ),
+        ),
+    )
+    return to_pcm(r.candidates[0].content.parts[0].inline_data.data)
+
+
+def chunks(text, limit=1000):
     parts, cur = [], ""
     for s in re.split(r"(?<=[।\.\?\!])\s+", text):
         if len(cur) + len(s) > limit and cur:
@@ -175,23 +238,6 @@ def chunks(text, limit=2200):
     return parts
 
 
-def tts(client, model, text):
-    r = client.models.generate_content(
-        model=model,
-        contents=STYLE + text,
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE)
-                )
-            ),
-        ),
-    )
-    return r.candidates[0].content.parts[0].inline_data.data
-
-
 def normalize(pcm, target=3500):
     rms = audioop.rms(pcm, 2)
     if rms == 0:
@@ -199,14 +245,50 @@ def normalize(pcm, target=3500):
     return audioop.mul(pcm, 2, min(target / rms, 4.0))
 
 
-SILENCE = b"\x00\x00" * int(24000 * 0.5)  # ০.৫ সেকেন্ড বিরতি
+def active_seconds(pcm, thr=300):
+    fl = 480 * 2  # 20ms @ 24kHz, 16-bit
+    n = 0
+    for i in range(0, len(pcm) - fl + 1, fl):
+        if audioop.rms(pcm[i:i + fl], 2) > thr:
+            n += 1
+    return max(n * 0.02, 0.1)
 
-pcm = b""
+
+def speech_chars(text):
+    return len(re.sub(r"<[^<>]+>|\s+", "", text))
+
+
+def change_tempo(pcm, factor):
+    open("t_in.raw", "wb").write(pcm)
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "t_in.raw",
+         "-filter:a", f"atempo={factor:.4f}", "-f", "s16le", "-ar", "24000", "-ac", "1",
+         "t_out.raw"],
+        check=True, capture_output=True,
+    )
+    return open("t_out.raw", "rb").read()
+
+
 parts = chunks(narration)
 print("মোট voice chunk:", len(parts))
+raw = []
 for n, part in enumerate(parts, 1):
     print("Voice chunk", n, "/", len(parts))
-    pcm += normalize(with_models(TTS_MODELS, lambda c, m, p=part: tts(c, m, p))) + SILENCE
+    pcm = with_models(TTS_MODELS, lambda c, m, p=part: tts(c, m, p))
+    raw.append(normalize(pcm))
+
+# প্রতিটা টুকরোর কথা বলার গতি মেপে মাঝামাঝি গতিতে মেলানো
+rates = [speech_chars(p) / active_seconds(a) for p, a in zip(parts, raw)]
+target = statistics.median(rates)
+print("গতি (অক্ষর/সেকেন্ড):", [round(r, 1) for r in rates], "target:", round(target, 1))
+
+SILENCE = b"\x00\x00" * int(24000 * 0.4)
+final = b""
+for r, a in zip(rates, raw):
+    factor = max(0.8, min(1.25, target / r))
+    if abs(factor - 1) > 0.03:
+        a = change_tempo(a, factor)
+    final += a + SILENCE
 
 stamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 base = re.sub(r"[^\w]+", "_", TOPIC)[:40] or "anidoc"
@@ -219,7 +301,7 @@ with wave.open(wav_file, "wb") as w:
     w.setnchannels(1)
     w.setsampwidth(2)
     w.setframerate(24000)
-    w.writeframes(pcm)
+    w.writeframes(final)
 subprocess.run(
     ["ffmpeg", "-y", "-i", wav_file, "-af", "loudnorm=I=-16:TP=-1.5:LRA=7",
      "-b:a", "192k", mp3_file],
