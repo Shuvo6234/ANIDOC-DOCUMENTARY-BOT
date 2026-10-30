@@ -32,7 +32,7 @@ jobs:
         run: |
           pip install -r requirements.txt
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          sudo apt-get install -y ffmpeg
 
       - name: Run bot
         env:
@@ -40,11 +40,10 @@ jobs:
           TOPIC: ${{ github.event.inputs.topic }}
           PROJECT: ${{ github.event.inputs.project }}
           MAX_RUN_MIN: "170"
-          PREMIUM_TEXT: "1"
-          BGM_VOL: "0.32"
-          LUFS: "-14"
           GEMINI_QUOTA_COOLDOWN_SEC: "60"
           GEMINI_TRANSIENT_COOLDOWN_SEC: "15"
+          TEXT_MODELS: "gemini-3.1-flash-lite,gemini-3.5-flash-lite"
+          TTS_MODELS: "gemini-3.8-flash-tts"
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GDRIVE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
@@ -67,5 +66,4 @@ jobs:
             image_map.json
             voiceover.mp3
             background_music.mp3
-            sfx_track.wav
             final_video.mp4
