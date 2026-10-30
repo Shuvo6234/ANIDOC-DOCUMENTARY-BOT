@@ -45,8 +45,12 @@ jobs:
           TEXT_MODELS: "gemini-3.1-flash-lite,gemini-3.5-flash-lite"
           TTS_MODELS: "gemini-3.8-flash-tts"
           # --- sync: ছোট block = নিখুঁত sync (1 = প্রতি scene আলাদা TTS) ---
-          BLOCK_CHARS: "300"
+          BLOCK_CHARS: "240"
           SCENE_CHARS: "60"
+          # --- voice ---
+          VOICE_SPEED: "0.95"
+          MAX_PAUSE: "0.18"
+          MIN_PAUSE_RUN: "0.25"
           # --- audio mix ---
           BGM_MOOD: "cinematic"
           BGM_VOL: "0.30"
