@@ -10,7 +10,16 @@ MODE = (os.getenv("MODE") or "prompts").strip()
 TOPIC = (os.getenv("TOPIC") or "").strip()
 PROJECT = (os.getenv("PROJECT") or "").strip()
 OUT_ID = os.environ["GDRIVE_FOLDER_ID"]
-SCENE_CHARS = int(os.getenv("SCENE_CHARS", "350"))  # বড় = কম ছবি লাগবে
+
+# প্রতি scene ≈ 4-6 সেকেন্ড। ~12 অক্ষর/সেকেন্ড ধরে 60 অক্ষর ≈ 5 সেকেন্ড।
+# video mode-এর log-এ "scene দৈর্ঘ্য" দেখে দরকারে এটা বদলাও (ছোট = দ্রুত scene change)।
+SCENE_CHARS = int(os.getenv("SCENE_CHARS", "60"))
+IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "16:9")
+
+# ---- music / mix সেটিং (সব env দিয়ে বদলানো যাবে) ----
+BGM_MOOD = os.getenv("BGM_MOOD", "cinematic")   # cinematic | dark | calm | epic
+BGM_VOL = float(os.getenv("BGM_VOL", "0.45"))   # 0.2 (খুব মৃদু) - 0.8 (জোরালো)
+LUFS = os.getenv("LUFS", "-14")                 # YouTube-এর জন্য -14
 
 PDF_PATH = "ANIDOC MAGICAL PROMPT v4.pdf"
 TEXT_MODELS = os.getenv(
@@ -191,22 +200,108 @@ def parse_json(text):
 
 
 def split_scenes(text, limit):
+    """narration-কে ~limit অক্ষরের (≈4-6 সেকেন্ড) scene-এ ভাগ করে।
+    আগে বাক্য, তারপর কমা, শেষে শব্দ ধরে কাটে — যাতে কাটার জায়গায় স্বাভাবিক বিরতি থাকে।"""
+    max_len, min_len = int(limit * 1.2), int(limit * 0.7)
     sents = [s.strip() for s in re.split(r"(?<=[।\.\?\!])\s+", text) if s.strip()]
-    scenes, cur = [], ""
+    pieces = []
     for s in sents:
-        if cur and len(cur) + len(s) > limit:
-            scenes.append(cur.strip())
+        if len(s) <= max_len:
+            pieces.append(s)
+            continue
+        for p in [x.strip() for x in re.split(r"(?<=[,;:])\s+", s) if x.strip()]:
+            if len(p) <= max_len:
+                pieces.append(p)
+                continue
             cur = ""
-        cur += s + " "
-    if cur.strip():
-        scenes.append(cur.strip())
-    if len(scenes) > 1 and len(scenes[-1]) < limit * 0.3:
-        scenes[-2] += " " + scenes.pop()
+            for w in p.split():
+                if cur and len(cur) + len(w) + 1 > max_len:
+                    pieces.append(cur)
+                    cur = w
+                else:
+                    cur = (cur + " " + w).strip()
+            if cur:
+                pieces.append(cur)
+    scenes, cur = [], ""
+    for p in pieces:
+        if cur and (len(cur) >= limit or len(cur) + len(p) + 1 > max_len):
+            scenes.append(cur)
+            cur = p
+        else:
+            cur = (cur + " " + p).strip()
+    if cur:
+        if scenes and len(cur) < min_len and len(scenes[-1]) + len(cur) + 1 <= max_len * 1.3:
+            scenes[-1] += " " + cur
+        else:
+            scenes.append(cur)
     return scenes
 
 
 # =====================================================================
-# MODE 1: script + image prompts + youtube package  (audio নেই)
+# Visual bible: character / clothing / shop / style consistency
+# =====================================================================
+def make_bible(pdf_part, narration):
+    """পুরো story পড়ে একবারই fixed visual description বানায়। পরে প্রতিটা image prompt-এ
+    এই description হুবহু বসানো হয়, তাই চেহারা-পোশাক-দোকান সব scene-এ এক থাকে।"""
+    ask = (
+        f"Documentary topic: {TOPIC}\n"
+        "সংযুক্ত PDF-এ ANIDOC-এর নির্দেশনা আছে (style/visual নিয়ম থাকলে মানো)। নিচের narration পড়ে "
+        "পুরো ভিডিওর জন্য একটা VISUAL BIBLE বানাও, যাতে সব image-এ একই চরিত্র, পোশাক, জায়গা ও style থাকে।\n"
+        "নিয়ম:\n"
+        "- সব description ইংরেজিতে, নির্দিষ্ট ও স্থির (পরে হুবহু copy-paste হবে)।\n"
+        "- character desc (40-70 শব্দ): বয়স, skin tone, মুখের গড়ন, চুল/দাড়ি, গড়ন, পোশাকের প্রতিটা অংশ "
+        "রঙ + কাপড়সহ, accessories (টুপি, ঘড়ি, চশমা...), জুতো। এক চরিত্র সব scene-এ একই পোশাকে।\n"
+        "- location desc (40-70 শব্দ): স্থাপত্য, দেয়াল/মেঝের রঙ, দোকান হলে সামনের অংশ, awning, shelf, "
+        "ভেতরের সাজ, জিনিসপত্র, আলো। readable লেখা/signboard text রাখবে না।\n"
+        "- props: বারবার আসা গুরুত্বপূর্ণ জিনিস (যেমন একটা নির্দিষ্ট পোশাক, গাড়ি, বই)। desc 20-40 শব্দ।\n"
+        "- style: একটা লাইনে পুরো ভিডিওর visual style, lens, lighting, color grade।\n"
+        "- narration-এ মানুষ/দোকান না থাকলে (যেমন শুধু বিজ্ঞান/ইতিহাস) characters/locations "
+        "খালি বা কম রাখো, বানিয়ে বাড়াবে না। সর্বোচ্চ 6 character, 5 location, 6 prop।\n"
+        'শুধু JSON: {"style": "...", "palette": "...", "characters": [{"id": "C1", "name": "...", "desc": "..."}], '
+        '"locations": [{"id": "L1", "name": "...", "desc": "..."}], "props": [{"id": "P1", "name": "...", "desc": "..."}]}\n\n'
+        "NARRATION:\n" + narration[:15000])
+    for attempt in range(3):
+        try:
+            data = with_models(TEXT_MODELS, lambda c, m: gen_text(c, m, [pdf_part, ask], json_mode=True))
+            b = parse_json(data)
+            b.setdefault("style", "cinematic photorealistic documentary, 35mm lens, natural light")
+            for k in ("characters", "locations", "props"):
+                b[k] = [x for x in b.get(k, []) if x.get("id") and x.get("desc")]
+            return b
+        except Exception as e:
+            print("Visual bible সমস্যা, আবার চেষ্টা:", str(e)[:100])
+    print("সতর্কতা: visual bible বানানো যায়নি, default style ব্যবহার হবে")
+    return {"style": "cinematic photorealistic documentary, 35mm lens, natural light, rich color grade",
+            "palette": "", "characters": [], "locations": [], "props": []}
+
+
+def compose_prompt(bible, sc):
+    """shot (scene-এর action) + fixed bible description = পূর্ণ, বিস্তারিত image prompt।"""
+    cmap = {x["id"]: x for x in bible["characters"]}
+    lmap = {x["id"]: x for x in bible["locations"]}
+    pmap = {x["id"]: x for x in bible["props"]}
+    parts = [sc["shot"].strip().rstrip(".") + "."]
+    chars = [cmap[i] for i in sc.get("characters", []) if i in cmap]
+    if chars:
+        parts.append("CHARACTERS (keep exactly identical in every image): " + " ".join(
+            f"{c.get('name', c['id'])}: {c['desc'].strip().rstrip('.')}." for c in chars))
+    loc = lmap.get(sc.get("location"))
+    if loc:
+        parts.append(f"SETTING (identical in every image): {loc.get('name', '')}: {loc['desc'].strip().rstrip('.')}.")
+    props = [pmap[i] for i in sc.get("props", []) if i in pmap]
+    if props:
+        parts.append("PROPS: " + " ".join(f"{p.get('name', p['id'])}: {p['desc'].strip().rstrip('.')}." for p in props))
+    style = bible["style"].strip().rstrip(".") + "."
+    if bible.get("palette"):
+        style += f" Color palette: {bible['palette'].strip().rstrip('.')}."
+    parts.append("STYLE: " + style)
+    parts.append(f"{IMAGE_ASPECT} widescreen, ultra detailed, sharp focus, consistent character faces and outfits, "
+                 "no text, no captions, no watermark, no logo, no extra fingers, no distorted faces.")
+    return " ".join(parts)
+
+
+# =====================================================================
+# MODE 1: script + visual bible + image prompts + youtube package
 # =====================================================================
 def run_prompts():
     if not TOPIC:
@@ -235,40 +330,64 @@ def run_prompts():
     narration = strip_tags(re.sub(r"\[[^\]\n]{1,60}\]", "", narration)).strip()
 
     texts = split_scenes(narration, SCENE_CHARS)
-    print("মোট scene (= ছবি লাগবে):", len(texts))
+    print("মোট scene (= ছবি লাগবে):", len(texts), f"(≈ {len(texts) * 5 / 60:.1f} মিনিট, 5 সেকেন্ড/scene ধরে)")
 
-    prompts = {}
-    B = 12
+    bible = make_bible(pdf_part, narration)
+    print("Visual bible:", len(bible["characters"]), "character,",
+          len(bible["locations"]), "location,", len(bible["props"]), "prop")
+
+    cids = ", ".join(x["id"] + "=" + x.get("name", "") for x in bible["characters"]) or "(নেই)"
+    lids = ", ".join(x["id"] + "=" + x.get("name", "") for x in bible["locations"]) or "(নেই)"
+    pids = ", ".join(x["id"] + "=" + x.get("name", "") for x in bible["props"]) or "(নেই)"
+
+    shots = {}
+    B = 10
     for i in range(0, len(texts), B):
         batch = [(i + j + 1, t) for j, t in enumerate(texts[i:i + B])]
         listing = "\n".join(f"SCENE {n}: {t}" for n, t in batch)
+        prev = ""
+        if i > 0 and i in shots:
+            prev = "আগের scene-এর shot (পুনরাবৃত্তি এড়াতে): " + shots[i]["shot"][:200] + "\n"
         ask = (
             f"Documentary topic: {TOPIC}\n"
-            "সংযুক্ত PDF-এ ANIDOC-এর নির্দেশনা আছে। PDF-এ image prompt বানানোর নিয়ম "
-            "(style, aspect ratio, ভাষা, visual consistency, কী করা যাবে না) থাকলে তা হুবহু মানো। "
-            "না থাকলে English-এ cinematic, realistic, 16:9 prompt লেখো। "
-            "নিচের প্রতিটা scene-এর narration-এর সাথে মেলে এমন একটা করে image prompt লেখো, "
-            "সব prompt-এ একই visual style রাখো।\n"
-            'শুধু JSON array দাও: [{"n": 1, "image_prompt": "..."}] — ঠিক এই scene নম্বরগুলো দিয়ে।\n\n'
-            + listing)
+            "সংযুক্ত PDF-এ ANIDOC-এর নির্দেশনা আছে (image-এর নিয়ম থাকলে মানো)। "
+            "প্রতিটা scene মাত্র ৪-৬ সেকেন্ডের একটা আলাদা shot। প্রতিটার জন্য লেখো:\n"
+            '- "shot": ইংরেজিতে 50-80 শব্দের বিস্তারিত বর্ণনা: narration-এর সাথে মেলে এমন action/ঘটনা, '
+            "shot type (wide/medium/close-up/over-the-shoulder/aerial/low-angle...), camera angle, lens, "
+            "lighting, mood, foreground ও background, composition। পাশের scene-এর চেয়ে angle বা subject আলাদা হবে। "
+            "চরিত্রদের পোশাক/চেহারা এখানে লিখবে না (সেটা আমি নিজে বসাব); চরিত্রকে শুধু নাম দিয়ে উল্লেখ করো।\n"
+            '- "characters": এই shot-এ যে character ID-গুলো দেখা যাবে\n'
+            '- "location": location ID (না থাকলে "")\n'
+            '- "props": দৃশ্যমান prop ID-র তালিকা\n'
+            f"Characters: {cids}\nLocations: {lids}\nProps: {pids}\n"
+            "শুধু ঐ ID-গুলোই ব্যবহার করো, নতুন বানাবে না।\n"
+            'শুধু JSON array: [{"n": 1, "shot": "...", "characters": ["C1"], "location": "L1", "props": []}] '
+            "— ঠিক এই scene নম্বরগুলো দিয়ে।\n" + prev + "\n" + listing)
         got = {}
         for attempt in range(3):
             try:
                 data = with_models(TEXT_MODELS, lambda c, m: gen_text(c, m, [pdf_part, ask], json_mode=True))
                 arr = parse_json(data)
-                got = {int(x["n"]): str(x["image_prompt"]).strip() for x in arr}
+                got = {int(x["n"]): x for x in arr if x.get("shot")}
                 if all(n in got for n, _ in batch):
                     break
             except Exception as e:
-                print("Image prompt parse সমস্যা, আবার চেষ্টা:", str(e)[:100])
+                print("Shot parse সমস্যা, আবার চেষ্টা:", str(e)[:100])
         for n, _ in batch:
             if n not in got:
                 sys.exit(f"Scene {n}-এর image prompt পাওয়া যায়নি, আবার run করো")
-            prompts[n] = got[n]
+            shots[n] = got[n]
         print("Image prompt তৈরি:", min(i + B, len(texts)), "/", len(texts))
 
-    scenes = [{"n": n, "narration": t, "image_prompt": prompts[n]}
-              for n, t in enumerate(texts, 1)]
+    scenes = []
+    for n, t in enumerate(texts, 1):
+        s = shots[n]
+        sc = {"n": n, "narration": t, "shot": str(s["shot"]).strip(),
+              "characters": [str(x) for x in (s.get("characters") or [])],
+              "location": str(s.get("location") or ""),
+              "props": [str(x) for x in (s.get("props") or [])]}
+        sc["image_prompt"] = compose_prompt(bible, sc)
+        scenes.append(sc)
 
     def make_pkg(client, model):
         ask = (
@@ -294,16 +413,22 @@ def run_prompts():
         "ছবিগুলো এই project folder-এ upload করো: " + proj_name,
         "ছবির নাম বদলানোর দরকার নেই; bot নিজেই বুঝে নেবে কোন ছবি কোন scene-এর।",
         "Thumbnail ছবিও এখানেই দিতে পারো (bot সেটা video থেকে বাদ দেবে)।",
-        "=" * 60, "",
+        "নিজের background music চাইলে 'bgm.mp3' নামে এই folder-এ দাও (না দিলে bot নিজে বানাবে)।",
+        "=" * 60, "", "VISUAL BIBLE (সব prompt-এ এটা আপনা-আপনি বসানো আছে)",
+        "STYLE: " + bible["style"], "PALETTE: " + str(bible.get("palette", "")), "",
     ]
+    for kind in ("characters", "locations", "props"):
+        for x in bible[kind]:
+            lines.append(f"[{x['id']}] {x.get('name', '')}: {x['desc']}")
+    lines += ["", "=" * 60, ""]
     for s in scenes:
-        lines += [f"SCENE {s['n']:02d}", f"Narration: {s['narration'][:160]}...",
+        lines += [f"SCENE {s['n']:02d}", f"Narration: {s['narration'][:160]}",
                   f"IMAGE PROMPT: {s['image_prompt']}", ""]
     open("image_prompts.txt", "w", encoding="utf-8").write("\n".join(lines))
     open("script.txt", "w", encoding="utf-8").write(script)
     open("youtube_package.txt", "w", encoding="utf-8").write(pkg)
-    json.dump({"topic": TOPIC, "scenes": scenes}, open("scenes.json", "w", encoding="utf-8"),
-              ensure_ascii=False, indent=1)
+    json.dump({"topic": TOPIC, "bible": bible, "scenes": scenes},
+              open("scenes.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
     for f, mime in [("image_prompts.txt", "text/plain"), ("script.txt", "text/plain"),
                     ("youtube_package.txt", "text/plain"), ("scenes.json", "application/json")]:
@@ -313,7 +438,7 @@ def run_prompts():
 
 
 # =====================================================================
-# MODE 2: audio + sync + edit → final_video.mp4
+# MODE 2: audio + sync + edit + music → final_video.mp4
 # =====================================================================
 SR, FPS, W, H = 24000, 25, 1920, 1080
 STYLE = ("calm, deep and authoritative documentary narrator, "
@@ -323,6 +448,7 @@ LEGACY_PREFIX = (
     "slow and steady pace, serious tone. Do not read these instructions:\n")
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
 VID_EXT = (".mp4", ".mov", ".mkv", ".webm")
+AUD_EXT = (".mp3", ".wav", ".m4a", ".aac")
 NUM_RE = re.compile(r"^(?:scene[_\- ]?)?(\d{1,3})(?=\D|$)", re.I)
 
 
@@ -406,7 +532,8 @@ def split_block(pcm, texts):
         for c in chars[:-1]:
             cum += c
             est = a + (b - a) * cum / total
-            lo, hi = max(int(est - 75), a + 1, prev + 1), min(int(est + 75), b - 1)
+            # scene ছোট (4-6 সেকেন্ড) তাই খোঁজার জানালা ±1.0 সেকেন্ড
+            lo, hi = max(int(est - 50), a + 1, prev + 1), min(int(est + 50), b - 1)
             best, bi = None, int(est)
             for i in range(lo, max(lo + 1, hi)):
                 w = r[i:i + 5]
@@ -447,7 +574,7 @@ def match_media(files, scenes):
     """ছবি/clip নামিয়ে AI দিয়ে scene-এর সাথে মেলায়। রিটার্ন: প্রতি scene-এর জন্য [ {path, video, name} ]"""
     n_scenes = len(scenes)
     media = [f for f in files if f["name"].lower().endswith(IMG_EXT + VID_EXT)
-             and not f["name"].lower().startswith(("thumb", "final"))]
+             and not f["name"].lower().startswith(("thumb", "final", "bgm"))]
     if not media:
         sys.exit("project folder-এ কোনো ছবি/video পাওয়া যায়নি")
     media.sort(key=lambda x: x["createdTime"])  # upload-এর ক্রম
@@ -455,8 +582,7 @@ def match_media(files, scenes):
     os.makedirs("media", exist_ok=True)
     info = {}
     for f in media:
-        safe = re.sub(r"[^\w.]+", "_", f["name"])
-        p = os.path.join("media", f"{f['id'][:8]}_{safe}")
+        p = os.path.join("media", f"{f['id'][:8]}_{re.sub(r'[^\w.]+', '_', f['name'])}")
         d_download(f["id"], p)
         info[f["id"]] = {"name": f["name"], "path": p,
                          "video": f["name"].lower().endswith(VID_EXT)}
@@ -481,15 +607,17 @@ def match_media(files, scenes):
 
     if todo:
         print("AI দিয়ে মেলানো হচ্ছে:", len(todo), "টা ছবি/clip")
-        desc = "\n".join(f"SCENE {s['n']}: {s['image_prompt'][:220]}" for s in scenes)
+        desc = "\n".join(
+            f"SCENE {s['n']}: {(s.get('shot') or s['image_prompt'])[:200]} | narration: {s['narration'][:60]}"
+            for s in scenes)
         os.makedirs("thumbs", exist_ok=True)
         B = 8
         for i in range(0, len(todo), B):
             batch = todo[i:i + B]
             ask = (
-                "নিচে একটা documentary-র scene তালিকা (প্রতিটার image prompt সহ) আছে। তারপর কিছু ছবি "
+                "নিচে একটা documentary-র scene তালিকা (প্রতিটার shot বর্ণনা সহ) আছে। তারপর কিছু ছবি "
                 "(IMAGE 1, 2, ...) দেওয়া আছে, যেগুলো ওই prompt থেকেই AI দিয়ে বানানো। প্রতিটা ছবি "
-                "কোন scene-এর prompt-এর সাথে সবচেয়ে বেশি মেলে সেটা বলো। ছবিগুলো সাধারণত scene-এর ক্রমেই "
+                "কোন scene-এর সাথে সবচেয়ে বেশি মেলে সেটা বলো। ছবিগুলো সাধারণত scene-এর ক্রমেই "
                 "বানানো ও দেওয়া হয়, তাই দুটো scene সমান মিললে ক্রমকে হালকা ইঙ্গিত ধরো। "
                 "ছবিটা যদি YouTube thumbnail-এর মতো হয় (বড় text/title সহ) বা কোনো scene-এর সাথেই না মেলে, "
                 'scene = 0 দাও। শুধু JSON array দাও: [{"image": 1, "scene": 5}, ...]\n\n' + desc)
@@ -547,23 +675,138 @@ def build_groups(media, info, mapping, n_scenes):
     return result
 
 
+# ---------------------------------------------------------------------
+# Video clip: Ken Burns (4 রকম move) — scene-এর মাঝে hard cut, শুধু শুরু/শেষে fade
+# ---------------------------------------------------------------------
 ENC = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", str(FPS)]
 
 
-def make_clip(src, is_video, frames, out, zoom_in):
+def make_clip(src, is_video, frames, out, variant, fade_in=False, fade_out=False):
     dur = frames / FPS
-    fd = min(0.3, dur / 3)
-    fx = f"fade=t=in:st=0:d={fd:.2f},fade=t=out:st={dur - fd:.2f}:d={fd:.2f}"
+    fx = []
+    if fade_in:
+        fx.append("fade=t=in:st=0:d=0.8")
+    if fade_out:
+        fx.append(f"fade=t=out:st={max(dur - 1.5, 0):.2f}:d=1.5")
+    fxs = ("," + ",".join(fx)) if fx else ""
     if is_video:
-        vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS},setsar=1,{fx}"
+        vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS},setsar=1{fxs}"
         cmd = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", src, "-vf", vf,
                "-frames:v", str(frames), "-an", *ENC, out]
     else:
-        z = f"1+0.12*on/{frames}" if zoom_in else f"1.12-0.12*on/{frames}"
+        v = variant % 4
+        px = "iw/2-(iw/zoom/2)"
+        py = "ih/2-(ih/zoom/2)"
+        if v == 0:      # slow zoom in
+            z, x, y = f"1+0.12*on/{frames}", px, py
+        elif v == 1:    # slow zoom out
+            z, x, y = f"1.12-0.12*on/{frames}", px, py
+        elif v == 2:    # pan বাঁ → ডান
+            z, x, y = "1.10", f"(iw-iw/zoom)*on/{frames}", py
+        else:           # pan ডান → বাঁ
+            z, x, y = "1.10", f"(iw-iw/zoom)*(1-on/{frames})", py
         vf = ("scale=2880:1620:force_original_aspect_ratio=increase,crop=2880:1620,setsar=1,"
-              f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={W}x{H}:fps={FPS},{fx}")
+              f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS}{fxs}")
         cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-frames:v", str(frames), "-an", *ENC, out]
     subprocess.run(cmd, check=True, capture_output=True)
+
+
+# ---------------------------------------------------------------------
+# Background music: নিজের bgm ফাইল, নইলে ffmpeg দিয়ে cinematic score তৈরি
+# (pad + sub bass + chord-change boom + pluck arpeggio + reverb + stereo width)
+# ---------------------------------------------------------------------
+MOODS = {
+    "cinematic": [(57, "m"), (53, "M"), (48, "M"), (55, "M")],   # Am F C G
+    "dark":      [(48, "m"), (44, "M"), (51, "M"), (46, "M")],   # Cm Ab Eb Bb
+    "calm":      [(48, "M"), (55, "M"), (57, "m"), (53, "M")],   # C G Am F
+    "epic":      [(50, "m"), (46, "M"), (53, "M"), (48, "M")],   # Dm Bb F C
+}
+CHORD_S, OVL = 12.0, 3.0
+
+
+def _mf(n):
+    return 440.0 * 2 ** ((n - 69) / 12)
+
+
+def synth_loop(mood, out):
+    prog = MOODS.get(mood, MOODS["cinematic"])
+    srcs, delays = [], []
+
+    def add(expr, dur, at):
+        srcs.append(f"aevalsrc='{expr}':s=44100:d={dur:.2f}")
+        delays.append(int(at * 1000))
+
+    total = CHORD_S * len(prog)
+    for ci, (root, q) in enumerate(prog):
+        at = ci * CHORD_S
+        notes = [root, root + (3 if q == "m" else 4), root + 7, root + 12]
+        D = CHORD_S + OVL
+        env = f"min(1,t/{OVL})*min(1,({D}-t)/{OVL})"
+        for n in notes:                       # pad: detune করা দুটো sine + হালকা harmonic
+            f = _mf(n)
+            for det in (0.996, 1.004):
+                add(f"0.05*sin(2*PI*{f * det:.3f}*t)*{env}", D, at)
+            add(f"0.015*sin(2*PI*{f * 2:.3f}*t)*{env}", D, at)
+        add(f"0.16*sin(2*PI*{_mf(root - 12):.3f}*t)*min(1,t/2)*min(1,({D}-t)/2)", D, at)   # sub bass
+        add("0.55*sin(2*PI*(42+70*exp(-9*t))*t)*exp(-1.6*t)", 4.0, at)                    # deep boom
+        arp = [notes[0] + 12, notes[1] + 12, notes[2] + 12, notes[3] + 12, notes[2] + 12, notes[1] + 12]
+        for k, n in enumerate(arp):           # pluck arpeggio
+            tt = at + 1.5 + k * 1.8
+            if tt + 3 > total + OVL:
+                continue
+            add(f"0.07*sin(2*PI*{_mf(n):.3f}*t)*exp(-1.8*t)*min(1,t/0.01)", 3.0, tt)
+
+    cmd = ["ffmpeg", "-y"]
+    for s in srcs:
+        cmd += ["-f", "lavfi", "-i", s]
+    parts, labels = [], []
+    for i, dl in enumerate(delays):
+        parts.append(f"[{i}:a]adelay={dl}|{dl},apad=whole_dur={total + OVL:.1f}[a{i}]")
+        labels.append(f"[a{i}]")
+    parts.append(
+        "".join(labels) + f"amix=inputs={len(labels)}:normalize=0:duration=longest,"
+        f"atrim=0:{total:.2f},lowpass=f=2200,highpass=f=30,"
+        "aecho=0.8:0.9:900|1700:0.35|0.25,asplit[l][r];"
+        "[r]adelay=22[r2];[l][r2]amerge=inputs=2,alimiter=limit=0.9[outa]")
+    cmd += ["-filter_complex", ";".join(parts), "-map", "[outa]", "-ar", "44100", out]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def make_bgm(dur, files):
+    """রিটার্ন: ঠিক dur সেকেন্ডের (loop + fade সহ) music ফাইলের path।"""
+    user = next((f for f in files if f["name"].lower().startswith("bgm")
+                 and f["name"].lower().endswith(AUD_EXT)), None)
+    if user:
+        d_download(user["id"], "bgm_src")
+        src = "bgm_src"
+        print("bgm: নিজের ফাইল ব্যবহার হচ্ছে (" + user["name"] + ")")
+    else:
+        synth_loop(BGM_MOOD, "bgm_loop.wav")
+        src = "bgm_loop.wav"
+        print(f"bgm: '{BGM_MOOD}' mood-এ নিজে বানানো হলো")
+    subprocess.run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", src, "-t", f"{dur:.2f}",
+                    "-af", f"afade=t=in:d=3,afade=t=out:st={max(dur - 5, 0):.2f}:d=5",
+                    "-ar", "44100", "bgm_full.wav"], check=True, capture_output=True)
+    return "bgm_full.wav"
+
+
+def final_mix(total, bgm):
+    """voice-কে পরিষ্কার করে, music duck করে, mix করে YouTube loudness-এ আনে।"""
+    fc = (
+        # voice: low-cut + হালকা compression
+        "[1:a]highpass=f=70,acompressor=threshold=-20dB:ratio=3:attack=10:release=150,"
+        "aformat=sample_rates=44100:channel_layouts=stereo,asplit=2[v1][v2];"
+        # music: ভলিউম + voice-এর frequency-তে জায়গা ছাড়া
+        f"[2:a]volume={BGM_VOL},equalizer=f=1500:t=q:w=1:g=-4,"
+        "aformat=sample_rates=44100:channel_layouts=stereo[m];"
+        # voice বললে music আপনা-আপনি নিচে নামে, বিরতিতে আবার ওঠে
+        "[m][v2]sidechaincompress=threshold=0.02:ratio=6:attack=30:release=600[duck];"
+        "[v1][duck]amix=inputs=2:duration=first:normalize=0,"
+        f"loudnorm=I={LUFS}:TP=-1.5:LRA=9,afade=t=out:st={max(total - 2, 0):.2f}:d=2[a]")
+    subprocess.run(["ffmpeg", "-y", "-i", "video_noaudio.mp4", "-i", "voice.wav", "-i", bgm,
+                    "-filter_complex", fc, "-map", "0:v", "-map", "[a]",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest",
+                    "-movflags", "+faststart", "final_video.mp4"], check=True, capture_output=True)
 
 
 def run_video():
@@ -628,15 +871,21 @@ def run_video():
         segs[-1] += b"\x00\x00" * int(SR * 0.3)
         scene_audio += segs
 
+    durs = [len(s) / (2 * SR) for s in scene_audio]
+    print(f"scene দৈর্ঘ্য: min {min(durs):.1f}s, গড় {statistics.mean(durs):.1f}s, max {max(durs):.1f}s "
+          f"(লক্ষ্য 4-6s; গড় বেশি হলে SCENE_CHARS কমাও, কম হলে বাড়াও)")
+
     full = b"".join(scene_audio)
     with wave.open("voice.wav", "wb") as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR)
         w.writeframes(full)
-    print(f"মোট audio: {len(full) / (2 * SR) / 60:.1f} মিনিট")
+    total = len(full) / (2 * SR)
+    print(f"মোট audio: {total / 60:.1f} মিনিট")
 
     # ---- প্রতিটা scene-এর clip ----
     os.makedirs("clips", exist_ok=True)
     clip_files, t_acc, f_acc, gi = [], 0.0, 0, 0
+    n_total_scenes = len(scene_audio)
     for si, (pcm_seg, grp) in enumerate(zip(scene_audio, media_groups)):
         t_acc += len(pcm_seg) / (2 * SR)
         end_f = round(t_acc * FPS)
@@ -646,11 +895,13 @@ def run_video():
         for j, inf in enumerate(grp):
             part = max(frames // k + (1 if j < frames % k else 0), 12)
             out = f"clips/c{gi:05d}.mp4"
-            make_clip(inf["path"], inf["video"], part, out, zoom_in=(gi % 2 == 0))
+            make_clip(inf["path"], inf["video"], part, out, variant=gi,
+                      fade_in=(gi == 0),
+                      fade_out=(si == n_total_scenes - 1 and j == k - 1))
             clip_files.append(out)
             gi += 1
-        if (si + 1) % 5 == 0 or si + 1 == len(scene_audio):
-            print(f"Clip তৈরি: {si + 1}/{len(scene_audio)} scene")
+        if (si + 1) % 5 == 0 or si + 1 == n_total_scenes:
+            print(f"Clip তৈরি: {si + 1}/{n_total_scenes} scene")
 
     with open("list.txt", "w") as lf:
         for c in clip_files:
@@ -658,17 +909,20 @@ def run_video():
     subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "list.txt",
                     "-c", "copy", "video_noaudio.mp4"], check=True, capture_output=True)
 
+    # ---- music + mix ----
     subprocess.run(["ffmpeg", "-y", "-i", "voice.wav", "-af", "loudnorm=I=-16:TP=-1.5:LRA=7",
                     "-b:a", "192k", "voiceover.mp3"], check=True, capture_output=True)
-    subprocess.run(["ffmpeg", "-y", "-i", "video_noaudio.mp4", "-i", "voice.wav",
-                    "-map", "0:v", "-map", "1:a", "-af", "loudnorm=I=-16:TP=-1.5:LRA=7",
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest",
-                    "-movflags", "+faststart", "final_video.mp4"], check=True, capture_output=True)
+    bgm = make_bgm(total + 1, files)
+    final_mix(total, bgm)
+    subprocess.run(["ffmpeg", "-y", "-i", bgm, "-b:a", "192k", "background_music.mp3"],
+                   check=True, capture_output=True)
 
     d_upload("final_video.mp4", "final_video.mp4", pid, "video/mp4")
     print("Uploaded: final_video.mp4")
     d_upload("voiceover.mp3", "voiceover.mp3", pid, "audio/mpeg")
     print("Uploaded: voiceover.mp3")
+    d_upload("background_music.mp3", "background_music.mp3", pid, "audio/mpeg")
+    print("Uploaded: background_music.mp3")
     try:
         d_delete(cache_id)
     except Exception as e:
