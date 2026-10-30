@@ -31,6 +31,7 @@ jobs:
       - name: Install
         run: |
           pip install -r requirements.txt
+          sudo apt-get update
           sudo apt-get install -y ffmpeg
 
       - name: Run bot
@@ -38,6 +39,9 @@ jobs:
           MODE: ${{ github.event.inputs.mode }}
           TOPIC: ${{ github.event.inputs.topic }}
           PROJECT: ${{ github.event.inputs.project }}
+          MAX_RUN_MIN: "170"
+          GEMINI_QUOTA_COOLDOWN_SEC: "60"
+          GEMINI_TRANSIENT_COOLDOWN_SEC: "15"
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GDRIVE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
@@ -45,15 +49,19 @@ jobs:
           GDRIVE_FOLDER_ID: ${{ secrets.OUTPUT_FOLDER_ID }}
         run: python bot.py
 
-      - name: Save backup (text only)
+      - name: Save backup
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: output
+          name: anidoc-output-${{ github.run_id }}
           if-no-files-found: ignore
+          retention-days: 14
           path: |
             script.txt
             image_prompts.txt
             youtube_package.txt
             scenes.json
+            image_map.json
             voiceover.mp3
+            background_music.mp3
+            final_video.mp4
