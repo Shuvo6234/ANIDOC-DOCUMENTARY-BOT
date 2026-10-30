@@ -26,25 +26,29 @@ PROJECT = (os.getenv("PROJECT") or "").strip()
 OUT_ID = os.environ["GDRIVE_FOLDER_ID"]
 
 # প্রতি scene ≈ 4-6 সেকেন্ড। ~12 অক্ষর/সেকেন্ড ধরে 60 অক্ষর ≈ 5 সেকেন্ড।
-# video mode-এর log-এ "scene দৈর্ঘ্য" দেখে দরকারে এটা বদলাও (ছোট = দ্রুত scene change)।
 SCENE_CHARS = int(os.getenv("SCENE_CHARS", "60"))
 IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "16:9")
 
-# ---- music / mix সেটিং (সব env দিয়ে বদলানো যাবে) ----
+# প্রতি TTS block-এ সর্বোচ্চ কত অক্ষর। ছোট = sync বেশি নিখুঁত (API call বেশি)।
+# BLOCK_CHARS=1 দিলে প্রতিটা scene আলাদা TTS হবে (100% exact sync)।
+BLOCK_CHARS = int(os.getenv("BLOCK_CHARS", "300"))
+
+# ---- music / mix সেটিং ----
 BGM_MOOD = os.getenv("BGM_MOOD", "cinematic")   # cinematic | dark | calm | epic
-BGM_VOL = float(os.getenv("BGM_VOL", "0.45"))   # 0.2 (খুব মৃদু) - 0.8 (জোরালো)
+BGM_VOL = float(os.getenv("BGM_VOL", "0.30"))   # 0.2 (খুব মৃদু) - 0.8 (জোরালো)
 LUFS = os.getenv("LUFS", "-14")                 # YouTube-এর জন্য -14
+# ---- sound effects ----
+SFX_ON = os.getenv("SFX", "1") == "1"
+SFX_VOL = float(os.getenv("SFX_VOL", "0.5"))
 # ---- নীরবতা কমানো ----
-MAX_PAUSE = float(os.getenv("MAX_PAUSE", "0.30"))        # লম্বা বিরতি ছেঁটে এতটা রাখে (সেকেন্ড)
-MIN_PAUSE_RUN = float(os.getenv("MIN_PAUSE_RUN", "0.45"))  # এর চেয়ে লম্বা নীরবতাই শুধু ছাঁটা হবে
+MAX_PAUSE = float(os.getenv("MAX_PAUSE", "0.30"))
+MIN_PAUSE_RUN = float(os.getenv("MIN_PAUSE_RUN", "0.45"))
 
 PDF_PATH = "ANIDOC MAGICAL PROMPT v4.pdf"
-# কম খরচের text model: script, scene, prompt ও image matching-এর জন্য
 TEXT_MODELS = os.getenv(
     "TEXT_MODELS", "gemini-3.1-flash-lite,gemini-3.5-flash-lite"
 ).split(",")
 
-# Voiceover-এর জন্য নির্দিষ্ট model — user preference অনুযায়ী
 TTS_MODELS = os.getenv("TTS_MODELS", "gemini-3.8-flash-tts").split(",")
 VOICE = os.getenv("VOICE", "Charon")
 
@@ -119,18 +123,13 @@ def d_delete(fid):
     drive.files().delete(fileId=fid).execute()
 
 
-# ---------- Gemini key scheduler (এই runner-এর সব thread-এর মধ্যে shared) ----------
+# ---------- Gemini key scheduler ----------
 class AllGeminiKeysExhausted(RuntimeError):
     """সব configured key-এর quota শেষ; retry না করে run বন্ধ করতে হবে।"""
 
 
 class Rotator:
-    """প্রতি key-তে এক সময়ে একটি request; 429 হলে cooldown, invalid হলে disable.
-
-    একই Python process-এর concurrent worker-দের মধ্যে BUSY/FREE অবস্থা thread-safe।
-    আলাদা GitHub runner/process-এর মধ্যে lock ভাগ হয় না; তার জন্য external transactional
-    lock service (যেমন Firestore) দরকার।
-    """
+    """প্রতি key-তে এক সময়ে একটি request; 429 হলে cooldown, invalid হলে disable."""
     def __init__(self, keys):
         self.keys = [
             {"no": i, "key": key, "state": "FREE", "until": 0.0, "last_error": ""}
@@ -146,7 +145,6 @@ class Rotator:
                 available = [x for x in self.keys if x["state"] == "FREE" or
                              (x["state"] == "COOLDOWN" and x["until"] <= now)]
                 if available:
-                    # round-robin, যাতে সব key সমানভাবে ব্যবহৃত হয়
                     available.sort(key=lambda x: ((x["no"] - 1 - self.cursor) % max(len(self.keys), 1)))
                     item = available[0]
                     item["state"] = "BUSY"
@@ -167,7 +165,6 @@ class Rotator:
                     print(f"সব Gemini key BUSY/COOLDOWN; {wait:.1f}s অপেক্ষা...")
                     self.cv.wait(timeout=wait)
                 else:
-                    # অন্য thread-এর BUSY key শেষ হওয়া পর্যন্ত অপেক্ষা
                     self.cv.wait(timeout=30)
 
     def _release(self, item, state="FREE", cooldown=0, error=""):
@@ -179,8 +176,6 @@ class Rotator:
 
     @staticmethod
     def _cooldown_seconds(msg):
-        # API error text-এ retry delay থাকলে সেটি ধরার চেষ্টা
-        import re
         m = re.search(r"retry(?:\s+in|after)[^0-9]{0,12}(\d+(?:\.\d+)?)\s*s", msg, re.I)
         if m:
             return max(5.0, min(float(m.group(1)) + 2.0, 900.0))
@@ -190,7 +185,6 @@ class Rotator:
 
     @staticmethod
     def _is_hard_quota_exhaustion(msg):
-        """Daily/plan quota exhaustion স্থায়ীভাবে mark করে; RPM/temporary 429 নয়।"""
         hard_markers = (
             "you exceeded your current quota",
             "quota exceeded",
@@ -204,7 +198,6 @@ class Rotator:
 
     def call(self, fn, rounds=int(os.getenv("GEMINI_ROUNDS", "3"))):
         last = None
-        # প্রতিটি key একবার করে পরীক্ষা; স্থায়ী quota exhaustion হলে সেটি আর retry নয়।
         max_attempts = max(1, rounds) * max(1, len(self.keys))
         for attempt in range(max_attempts):
             item = self._acquire()
@@ -304,6 +297,8 @@ NO_TAG_RULE = (
     "বিরতি বোঝাতে শুধু দাঁড়ি (।), কমা আর ... ব্যবহার করো।"
 )
 
+SFX_NAMES = ("whoosh", "boom", "riser", "wind", "heartbeat")
+
 
 def parse_json(text):
     text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
@@ -311,8 +306,7 @@ def parse_json(text):
 
 
 def split_scenes(text, limit):
-    """narration-কে ~limit অক্ষরের (≈4-6 সেকেন্ড) scene-এ ভাগ করে।
-    আগে বাক্য, তারপর কমা, শেষে শব্দ ধরে কাটে — যাতে কাটার জায়গায় স্বাভাবিক বিরতি থাকে।"""
+    """narration-কে ~limit অক্ষরের (≈4-6 সেকেন্ড) scene-এ ভাগ করে।"""
     max_len, min_len = int(limit * 1.2), int(limit * 0.7)
     sents = [s.strip() for s in re.split(r"(?<=[।\.\?\!])\s+", text) if s.strip()]
     pieces = []
@@ -352,8 +346,6 @@ def split_scenes(text, limit):
 # Visual bible: character / clothing / shop / style consistency
 # =====================================================================
 def make_bible(pdf_part, narration):
-    """পুরো story পড়ে একবারই fixed visual description বানায়। পরে প্রতিটা image prompt-এ
-    এই description হুবহু বসানো হয়, তাই চেহারা-পোশাক-দোকান সব scene-এ এক থাকে।"""
     ask = (
         f"Documentary topic: {TOPIC}\n"
         "সংযুক্ত PDF-এ ANIDOC-এর নির্দেশনা আছে (style/visual নিয়ম থাকলে মানো)। নিচের narration পড়ে "
@@ -387,7 +379,6 @@ def make_bible(pdf_part, narration):
 
 
 def compose_prompt(bible, sc):
-    """shot (scene-এর action) + fixed bible description = পূর্ণ, বিস্তারিত image prompt।"""
     cmap = {x["id"]: x for x in bible["characters"]}
     lmap = {x["id"]: x for x in bible["locations"]}
     pmap = {x["id"]: x for x in bible["props"]}
@@ -470,9 +461,11 @@ def run_prompts():
             '- "characters": এই shot-এ যে character ID-গুলো দেখা যাবে\n'
             '- "location": location ID (না থাকলে "")\n'
             '- "props": দৃশ্যমান prop ID-র তালিকা\n'
+            '- "sfx": whoosh (transition) | boom (নাটকীয় মুহূর্ত) | riser (revelation-এর আগে) | '
+            'wind (নির্জন/space) | heartbeat (suspense) | "" । প্রতি 8 scene-এ সর্বোচ্চ 1টা, বেশিরভাগ ""।\n'
             f"Characters: {cids}\nLocations: {lids}\nProps: {pids}\n"
             "শুধু ঐ ID-গুলোই ব্যবহার করো, নতুন বানাবে না।\n"
-            'শুধু JSON array: [{"n": 1, "shot": "...", "characters": ["C1"], "location": "L1", "props": []}] '
+            'শুধু JSON array: [{"n": 1, "shot": "...", "characters": ["C1"], "location": "L1", "props": [], "sfx": ""}] '
             "— ঠিক এই scene নম্বরগুলো দিয়ে।\n" + prev + "\n" + listing)
         got = {}
         for attempt in range(3):
@@ -493,10 +486,12 @@ def run_prompts():
     scenes = []
     for n, t in enumerate(texts, 1):
         s = shots[n]
+        sfx = str(s.get("sfx") or "").strip().lower()
         sc = {"n": n, "narration": t, "shot": str(s["shot"]).strip(),
               "characters": [str(x) for x in (s.get("characters") or [])],
               "location": str(s.get("location") or ""),
-              "props": [str(x) for x in (s.get("props") or [])]}
+              "props": [str(x) for x in (s.get("props") or [])],
+              "sfx": sfx if sfx in SFX_NAMES else ""}
         sc["image_prompt"] = compose_prompt(bible, sc)
         scenes.append(sc)
 
@@ -534,6 +529,7 @@ def run_prompts():
     lines += ["", "=" * 60, ""]
     for s in scenes:
         lines += [f"SCENE {s['n']:02d}", f"Narration: {s['narration'][:160]}",
+                  f"SFX: {s['sfx'] or '-'}",
                   f"IMAGE PROMPT: {s['image_prompt']}", ""]
     open("image_prompts.txt", "w", encoding="utf-8").write("\n".join(lines))
     open("script.txt", "w", encoding="utf-8").write(script)
@@ -549,14 +545,16 @@ def run_prompts():
 
 
 # =====================================================================
-# MODE 2: audio + sync + edit + music → final_video.mp4
+# MODE 2: audio + sync + edit + music + sfx → final_video.mp4
 # =====================================================================
 SR, FPS, W, H = 24000, 25, 1920, 1080
 STYLE = ("calm, deep and authoritative documentary narrator, "
-         "speaking slowly at a steady, measured pace with a serious cinematic tone")
+         "speaking slowly at a steady, measured pace with a serious cinematic tone, "
+         "warm, rich, natural, not robotic, consistent energy, emphasis on dramatic words")
 LEGACY_PREFIX = (
     "Read the following text aloud as a deep, calm, authoritative documentary narrator, "
-    "slow and steady pace, serious tone. Do not read these instructions:\n")
+    "slow and steady pace, serious tone, warm and natural, not robotic. "
+    "Do not read these instructions:\n")
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
 VID_EXT = (".mp4", ".mov", ".mkv", ".webm")
 AUD_EXT = (".mp3", ".wav", ".m4a", ".aac")
@@ -592,6 +590,7 @@ def tts(client, model, text):
         model=model, contents=prefix + text,
         config=types.GenerateContentConfig(
             response_modalities=["AUDIO"],
+            temperature=0.3, seed=7,   # block-এ block-এ গলার tone এক রাখতে
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE)))),
@@ -601,7 +600,10 @@ def tts(client, model, text):
 
 def normalize(pcm, target=3500):
     rms = audioop.rms(pcm, 2)
-    return pcm if rms == 0 else audioop.mul(pcm, 2, min(target / rms, 4.0))
+    if rms == 0:
+        return pcm
+    g = min(target / rms, 4.0, 30000 / max(audioop.max(pcm, 2), 1))  # clipping হবে না
+    return audioop.mul(pcm, 2, g)
 
 
 def frame_rms(pcm):
@@ -618,8 +620,6 @@ def speech_chars(t):
 
 
 def trim_pauses(pcm, thr=300, min_run=None, keep=None):
-    """TTS-এর লম্বা নীরবতা ছোট করে। min_run সেকেন্ডের বেশি লম্বা নীরবতা কেটে keep সেকেন্ড রাখে
-    (দুই পাশে অর্ধেক করে, যাতে কথা কেটে না যায়)। শুরু ও শেষের নীরবতাও ছাঁটে।"""
     min_run = MIN_PAUSE_RUN if min_run is None else min_run
     keep = MAX_PAUSE if keep is None else keep
     fl = int(SR * 0.02) * 2
@@ -641,7 +641,7 @@ def trim_pauses(pcm, thr=300, min_run=None, keep=None):
         run = j - i
         edge = i == 0 or j == n
         if edge:
-            k = min(run, int(0.08 / 0.02))          # শুরু/শেষে সর্বোচ্চ 0.08 সেকেন্ড
+            k = min(run, int(0.08 / 0.02))
             seg = pcm[i * fl:(i + k) * fl] if i == 0 else pcm[(j - k) * fl:j * fl]
         elif run > min_f:
             h = keep_f // 2
@@ -664,35 +664,56 @@ def change_tempo(pcm, factor):
 
 
 def split_block(pcm, texts):
-    """এক block-এর audio-কে scene অনুযায়ী কাটে: অক্ষর-অনুপাতে আন্দাজ করে, তারপর কাছের নীরবতায় কাটে।"""
+    """এক block-এর audio-কে scene অনুযায়ী কাটে: অক্ষর-অনুপাতে আন্দাজ করে,
+    তারপর DP দিয়ে আসল নীরবতার জায়গাগুলোর সাথে সবচেয়ে ভালো মিলিয়ে কাটে।"""
     if len(texts) == 1:
         return [pcm]
     r = frame_rms(pcm)
-    act = [i for i, v in enumerate(r) if v > 300]
     fl = int(SR * 0.02) * 2
+    n = len(r)
+    act = [i for i, v in enumerate(r) if v > 300]
+    K = len(texts) - 1
     if not act:
-        n = len(r)
-        cuts = [n * (k + 1) // len(texts) for k in range(len(texts) - 1)]
+        cuts = [n * (k + 1) // len(texts) for k in range(K)]
     else:
         a, b = act[0], act[-1] + 1
+        runs, i = [], a
+        while i < b:
+            if r[i] <= 300:
+                j = i
+                while j < b and r[j] <= 300:
+                    j += 1
+                if j - i >= 4:
+                    runs.append(((i + j) // 2, j - i))
+                i = j
+            else:
+                i += 1
         chars = [speech_chars(t) for t in texts]
-        total, cum, cuts, prev = sum(chars), 0, [], 0
+        total, cum, est = sum(chars), 0, []
         for c in chars[:-1]:
             cum += c
-            est = a + (b - a) * cum / total
-            # scene ছোট (4-6 সেকেন্ড) তাই খোঁজার জানালা ±1.0 সেকেন্ড
-            lo, hi = max(int(est - 50), a + 1, prev + 1), min(int(est + 50), b - 1)
-            best, bi = None, int(est)
-            for i in range(lo, max(lo + 1, hi)):
-                w = r[i:i + 5]
-                if not w:
-                    break
-                v = sum(w) / len(w)
-                if best is None or v < best - 1e-9 or (abs(v - best) < 1e-9 and abs(i - est) < abs(bi - est)):
-                    best, bi = v, i + 2
-            bi = max(bi, prev + 1)
-            cuts.append(bi)
-            prev = bi
+            est.append(a + (b - a) * cum / total)
+        if len(runs) < K:
+            cuts = [int(e) for e in est]
+        else:
+            M, INF = len(runs), 1e18
+            cost = lambda k, m: abs(runs[m][0] - est[k]) / 25.0 - min(runs[m][1], 20) / 4.0
+            dp = [[INF] * M for _ in range(K)]
+            par = [[-1] * M for _ in range(K)]
+            for m in range(M):
+                dp[0][m] = cost(0, m)
+            for k in range(1, K):
+                for m in range(M):
+                    for p in range(m):
+                        v = dp[k - 1][p] + cost(k, m)
+                        if v < dp[k][m]:
+                            dp[k][m], par[k][m] = v, p
+            m = min(range(M), key=lambda x: dp[K - 1][x])
+            cuts = []
+            for k in range(K - 1, -1, -1):
+                cuts.append(runs[m][0])
+                m = par[k][m]
+            cuts.reverse()
     bounds = [0] + [c * fl for c in cuts] + [len(pcm)]
     return [pcm[bounds[k]:bounds[k + 1]] for k in range(len(texts))]
 
@@ -719,8 +740,9 @@ def make_thumb(path, is_video, out):
 
 
 def match_media(files, scenes):
-    """ছবি/clip নামিয়ে AI দিয়ে scene-এর সাথে মেলায়। রিটার্ন: প্রতি scene-এর জন্য [ {path, video, name} ]"""
+    """ছবি/clip নামিয়ে AI দিয়ে scene-এর সাথে মেলায়।"""
     n_scenes = len(scenes)
+
     def ok_name(nm):
         low = nm.lower()
         return low.endswith(IMG_EXT + VID_EXT) and not low.startswith(("thumb", "final", "bgm", "."))
@@ -738,7 +760,7 @@ def match_media(files, scenes):
         info[f["id"]] = {"name": f["name"], "path": p,
                          "video": f["name"].lower().endswith(VID_EXT)}
 
-    # ---- zip ফাইল: নামিয়ে খুলে ভেতরের ছবি/clip যোগ করা ----
+    # ---- zip ফাইল ----
     seen_names = {f["name"] for f in media}
     for z in [f for f in files if f["name"].lower().endswith(".zip")]:
         zp = f"media_{z['id'][:8]}.zip"
@@ -752,7 +774,7 @@ def match_media(files, scenes):
             for k, e in enumerate(entries):
                 base = os.path.basename(e.filename)
                 nm = base
-                if nm in seen_names:  # ভিন্ন subfolder-এ একই নাম থাকলে আলাদা করা
+                if nm in seen_names:
                     stem, ext = os.path.splitext(base)
                     nm = f"{stem}_{z['id'][:4]}{k}{ext}"
                 seen_names.add(nm)
@@ -768,10 +790,9 @@ def match_media(files, scenes):
 
     if not media:
         sys.exit("project folder-এ কোনো ছবি/video (বা zip-এর ভেতরে) পাওয়া যায়নি")
-    media.sort(key=lambda x: (x["createdTime"], nat(x["name"])))  # upload-এর ক্রম, তারপর নামের ক্রম
+    media.sort(key=lambda x: (x["createdTime"], nat(x["name"])))
     print("মিডিয়া download:", len(media), "টা ফাইল")
 
-    # আগের map (হাতে ঠিক করা থাকলে সেটাই)
     old, old_id = {}, next((x["id"] for x in files if x["name"] == "image_map.json"), None)
     if old_id:
         d_download(old_id, "image_map_old.json")
@@ -823,13 +844,12 @@ def match_media(files, scenes):
             for k, f in enumerate(batch, 1):
                 if k in got:
                     mapping[f["id"]] = max(0, min(got[k], n_scenes))
-                else:  # AI ব্যর্থ হলে upload-ক্রম অনুযায়ী
+                else:
                     pos = media.index(f)
                     mapping[f["id"]] = min(pos + 1, n_scenes)
                     print("AI মেলাতে পারেনি, ক্রম অনুযায়ী ধরা হলো:", f["name"])
             time.sleep(3)
 
-    # map সেভ (নিজে সংশোধন করা যাবে) + log-এ দেখানো
     out_map = {info[f["id"]]["name"]: mapping[f["id"]] for f in media}
     for nm, sc in out_map.items():
         print(f"  {nm}  ->  scene {sc if sc else '(বাদ)'}")
@@ -859,9 +879,10 @@ def build_groups(media, info, mapping, n_scenes):
 
 
 # ---------------------------------------------------------------------
-# Video clip: Ken Burns (4 রকম move) — scene-এর মাঝে hard cut, শুধু শুরু/শেষে fade
+# Video clip: Ken Burns (4 রকম move) — high quality encode
 # ---------------------------------------------------------------------
-ENC = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", str(FPS)]
+ENC = ["-c:v", "libx264", "-preset", "faster", "-crf", "16", "-profile:v", "high",
+       "-pix_fmt", "yuv420p", "-r", str(FPS)]
 
 
 def make_clip(src, is_video, frames, out, variant, fade_in=False, fade_out=False):
@@ -873,7 +894,8 @@ def make_clip(src, is_video, frames, out, variant, fade_in=False, fade_out=False
         fx.append(f"fade=t=out:st={max(dur - 1.5, 0):.2f}:d=1.5")
     fxs = ("," + ",".join(fx)) if fx else ""
     if is_video:
-        vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS},setsar=1{fxs}"
+        vf = (f"scale={W}:{H}:flags=lanczos:force_original_aspect_ratio=increase,"
+              f"crop={W}:{H},fps={FPS},setsar=1{fxs}")
         cmd = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", src, "-vf", vf,
                "-frames:v", str(frames), "-an", *ENC, out]
     else:
@@ -888,21 +910,20 @@ def make_clip(src, is_video, frames, out, variant, fade_in=False, fade_out=False
             z, x, y = "1.10", f"(iw-iw/zoom)*on/{frames}", py
         else:           # pan ডান → বাঁ
             z, x, y = "1.10", f"(iw-iw/zoom)*(1-on/{frames})", py
-        vf = ("scale=2880:1620:force_original_aspect_ratio=increase,crop=2880:1620,setsar=1,"
+        vf = ("scale=3200:1800:flags=lanczos:force_original_aspect_ratio=increase,crop=3200:1800,setsar=1,"
               f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS}{fxs}")
         cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-frames:v", str(frames), "-an", *ENC, out]
     subprocess.run(cmd, check=True, capture_output=True)
 
 
 # ---------------------------------------------------------------------
-# Background music: নিজের bgm ফাইল, নইলে ffmpeg দিয়ে cinematic score তৈরি
-# (pad + sub bass + chord-change boom + pluck arpeggio + reverb + stereo width)
+# Background music
 # ---------------------------------------------------------------------
 MOODS = {
-    "cinematic": [(57, "m"), (53, "M"), (48, "M"), (55, "M")],   # Am F C G
-    "dark":      [(48, "m"), (44, "M"), (51, "M"), (46, "M")],   # Cm Ab Eb Bb
-    "calm":      [(48, "M"), (55, "M"), (57, "m"), (53, "M")],   # C G Am F
-    "epic":      [(50, "m"), (46, "M"), (53, "M"), (48, "M")],   # Dm Bb F C
+    "cinematic": [(57, "m"), (53, "M"), (48, "M"), (55, "M")],
+    "dark":      [(48, "m"), (44, "M"), (51, "M"), (46, "M")],
+    "calm":      [(48, "M"), (55, "M"), (57, "m"), (53, "M")],
+    "epic":      [(50, "m"), (46, "M"), (53, "M"), (48, "M")],
 }
 CHORD_S, OVL = 12.0, 3.0
 
@@ -925,15 +946,15 @@ def synth_loop(mood, out):
         notes = [root, root + (3 if q == "m" else 4), root + 7, root + 12]
         D = CHORD_S + OVL
         env = f"min(1,t/{OVL})*min(1,({D}-t)/{OVL})"
-        for n in notes:                       # pad: detune করা দুটো sine + হালকা harmonic
+        for n in notes:
             f = _mf(n)
             for det in (0.996, 1.004):
                 add(f"0.05*sin(2*PI*{f * det:.3f}*t)*{env}", D, at)
             add(f"0.015*sin(2*PI*{f * 2:.3f}*t)*{env}", D, at)
-        add(f"0.16*sin(2*PI*{_mf(root - 12):.3f}*t)*min(1,t/2)*min(1,({D}-t)/2)", D, at)   # sub bass
-        add("0.55*sin(2*PI*(42+70*exp(-9*t))*t)*exp(-1.6*t)", 4.0, at)                    # deep boom
+        add(f"0.16*sin(2*PI*{_mf(root - 12):.3f}*t)*min(1,t/2)*min(1,({D}-t)/2)", D, at)
+        add("0.55*sin(2*PI*(42+70*exp(-9*t))*t)*exp(-1.6*t)", 4.0, at)
         arp = [notes[0] + 12, notes[1] + 12, notes[2] + 12, notes[3] + 12, notes[2] + 12, notes[1] + 12]
-        for k, n in enumerate(arp):           # pluck arpeggio
+        for k, n in enumerate(arp):
             tt = at + 1.5 + k * 1.8
             if tt + 3 > total + OVL:
                 continue
@@ -956,7 +977,6 @@ def synth_loop(mood, out):
 
 
 def make_bgm(dur, files):
-    """রিটার্ন: ঠিক dur সেকেন্ডের (loop + fade সহ) music ফাইলের path।"""
     user = next((f for f in files if f["name"].lower().startswith("bgm")
                  and f["name"].lower().endswith(AUD_EXT)), None)
     if user:
@@ -973,23 +993,86 @@ def make_bgm(dur, files):
     return "bgm_full.wav"
 
 
-def final_mix(total, bgm):
-    """voice-কে পরিষ্কার করে, music duck করে, mix করে YouTube loudness-এ আনে।"""
+# ---------------------------------------------------------------------
+# Sound effects (ffmpeg দিয়ে synthesize)
+# ---------------------------------------------------------------------
+SFX_SRC = {
+    "whoosh": "anoisesrc=d=1.4:c=pink:r=44100:a=0.6,highpass=f=300,lowpass=f=4500,"
+              "afade=t=in:d=0.7:curve=qsin,afade=t=out:st=0.7:d=0.7:curve=qsin,aecho=0.8:0.7:60:0.3",
+    "boom": "aevalsrc='0.9*sin(2*PI*(38+90*exp(-9*t))*t)*exp(-1.8*t)+0.25*(random(0)*2-1)*exp(-18*t)':s=44100:d=3,lowpass=f=900",
+    "riser": "aevalsrc='0.6*(random(0)*2-1)*pow(min(1,t/3),2)':s=44100:d=3,highpass=f=500,lowpass=f=6000,afade=t=out:st=2.8:d=0.2",
+    "wind": "anoisesrc=d=7:c=brown:r=44100:a=0.5,lowpass=f=600,afade=t=in:d=2,afade=t=out:st=5:d=2",
+    "heartbeat": "aevalsrc='0.9*sin(2*PI*52*t)*exp(-12*t)+0.7*gt(t,0.3)*sin(2*PI*46*t)*exp(-12*(t-0.3))':s=44100:d=1.1,"
+                 "aloop=loop=2:size=48510,lowpass=f=300",
+}
+# scene শুরুর আগে/পরে কত সেকেন্ডে effect বসবে (riser আগে শুরু হয়ে scene-এ পৌঁছে চূড়ায় ওঠে)
+SFX_OFF = {"whoosh": -0.15, "boom": 0.0, "riser": -2.6, "wind": 0.0, "heartbeat": 0.0}
+
+
+def sfx_file(name):
+    p = f"sfx_{name}.wav"
+    if not os.path.exists(p):
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", SFX_SRC[name], "-ar", "44100", "-ac", "2", p],
+                       check=True, capture_output=True)
+    return p
+
+
+def build_sfx(scenes, scene_audio, total):
+    tags = [s.get("sfx", "") for s in scenes]
+    if not any(tags):  # পুরনো project: auto
+        tags = [""] * len(scenes)
+        if tags:
+            tags[0] = "boom"
+        for i in range(6, len(tags), 7):
+            tags[i] = "whoosh"
+    starts, t = [], 0.0
+    for seg in scene_audio:
+        starts.append(t)
+        t += len(seg) / (2 * SR)
+    items = [(max(0.0, starts[i] + SFX_OFF[g]), g)
+             for i, g in enumerate(tags[:len(starts)]) if g in SFX_SRC]
+    if not items:
+        return None
+    print("SFX:", ", ".join(f"{g}@{at:.0f}s" for at, g in items[:30]), "..." if len(items) > 30 else "")
+    cmd, parts = ["ffmpeg", "-y"], []
+    for k, (at, g) in enumerate(items):
+        cmd += ["-i", sfx_file(g)]
+        ms = int(at * 1000)
+        parts.append(f"[{k}:a]adelay={ms}|{ms}[s{k}]")
+    lab = "".join(f"[s{k}]" for k in range(len(items)))
+    parts.append(f"{lab}amix=inputs={len(items)}:normalize=0:duration=longest,"
+                 f"apad=whole_dur={total:.2f},atrim=0:{total:.2f}[o]")
+    cmd += ["-filter_complex", ";".join(parts), "-map", "[o]", "-ar", "44100", "sfx_track.wav"]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return "sfx_track.wav"
+
+
+def final_mix(total, bgm, sfx=None):
+    """voice পরিষ্কার করে, music duck করে, sfx যোগ করে YouTube loudness-এ আনে।"""
+    fx = (f"[3:a]volume={SFX_VOL},aformat=sample_rates=44100:channel_layouts=stereo[fx];"
+          if sfx else "")
+    mixin = "[v1][duck][fx]amix=inputs=3" if sfx else "[v1][duck]amix=inputs=2"
     fc = (
-        # voice: low-cut + হালকা compression
-        "[1:a]highpass=f=70,acompressor=threshold=-20dB:ratio=3:attack=10:release=150,"
+        # voice: low-cut + warmth + presence + de-harsh + হালকা compression
+        "[1:a]highpass=f=80,equalizer=f=180:t=q:w=1:g=2,equalizer=f=3000:t=q:w=1.2:g=2.5,"
+        "equalizer=f=7500:t=q:w=2:g=-3,"
+        "acompressor=threshold=-22dB:ratio=2.5:attack=15:release=200:makeup=1.5,"
         "aformat=sample_rates=44100:channel_layouts=stereo,asplit=2[v1][v2];"
-        # music: ভলিউম + voice-এর frequency-তে জায়গা ছাড়া
+        # music
         f"[2:a]volume={BGM_VOL},equalizer=f=1500:t=q:w=1:g=-4,"
         "aformat=sample_rates=44100:channel_layouts=stereo[m];"
-        # voice বললে music আপনা-আপনি নিচে নামে, বিরতিতে আবার ওঠে
+        # voice বললে music নিচে নামে
         "[m][v2]sidechaincompress=threshold=0.02:ratio=6:attack=30:release=600[duck];"
-        "[v1][duck]amix=inputs=2:duration=first:normalize=0,"
+        + fx +
+        f"{mixin}:duration=first:normalize=0,"
         f"loudnorm=I={LUFS}:TP=-1.5:LRA=9,afade=t=out:st={max(total - 2, 0):.2f}:d=2[a]")
-    subprocess.run(["ffmpeg", "-y", "-i", "video_noaudio.mp4", "-i", "voice.wav", "-i", bgm,
-                    "-filter_complex", fc, "-map", "0:v", "-map", "[a]",
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest",
-                    "-movflags", "+faststart", "final_video.mp4"], check=True, capture_output=True)
+    cmd = ["ffmpeg", "-y", "-i", "video_noaudio.mp4", "-i", "voice.wav", "-i", bgm]
+    if sfx:
+        cmd += ["-i", sfx]
+    cmd += ["-filter_complex", fc, "-map", "0:v", "-map", "[a]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest",
+            "-movflags", "+faststart", "final_video.mp4"]
+    subprocess.run(cmd, check=True, capture_output=True)
 
 
 def run_video():
@@ -1000,7 +1083,7 @@ def run_video():
     d_download(sid, "scenes.json")
     scenes = json.load(open("scenes.json", encoding="utf-8"))["scenes"]
 
-    # ---- ছবি মেলানো (audio-র আগে, যাতে ভুল হলে আগেই ধরা পড়ে) ----
+    # ---- ছবি মেলানো ----
     media, info, mapping, old_map_id = match_media(files, scenes)
     media_groups = build_groups(media, info, mapping, len(scenes))
     if old_map_id:
@@ -1010,15 +1093,16 @@ def run_video():
             print("পুরনো image_map মোছা যায়নি:", str(e)[:100])
     d_upload("image_map.json", "image_map.json", pid, "application/json")
 
-    # ---- audio: block অনুযায়ী, cache সহ ----
+    # ---- audio: ছোট block, cache সহ ----
     blocks, cur = [], []
     for s in scenes:
-        if cur and sum(len(x["narration"]) for x in cur) + len(s["narration"]) > 1000:
+        if cur and sum(len(x["narration"]) for x in cur) + len(s["narration"]) > BLOCK_CHARS:
             blocks.append(cur)
             cur = []
         cur.append(s)
     if cur:
         blocks.append(cur)
+    print(f"Audio block: {len(blocks)}টা (BLOCK_CHARS={BLOCK_CHARS})")
 
     cache_id = next((f["id"] for f in files if f["name"] == "_audio_cache"), None) or d_mkdir("_audio_cache", pid)
     cache = {f["name"]: f["id"] for f in d_list(cache_id)}
@@ -1036,7 +1120,7 @@ def run_video():
             pcm = normalize(with_models(TTS_MODELS, lambda c, m, t=text: tts(c, m, t)))
             open("blk.pcm", "wb").write(pcm)
             d_upload("blk.pcm", key, cache_id, "application/octet-stream")
-            time.sleep(5)
+            time.sleep(1)
         raw.append(pcm)
 
     before = sum(len(p) for p in raw) / (2 * SR)
@@ -1044,7 +1128,7 @@ def run_video():
     after = sum(len(p) for p in raw) / (2 * SR)
     print(f"নীরবতা ছাঁটা: {before:.0f}s -> {after:.0f}s ({before - after:.0f}s কমেছে)")
 
-    # ---- গতি সমান করা ----
+    # ---- গতি সমান করা (হালকা, যাতে tone না বদলায়) ----
     texts_b = [" ".join(s["narration"] for s in blk) for blk in blocks]
     rates = [speech_chars(t) / active_seconds(p) for t, p in zip(texts_b, raw)]
     target = statistics.median(rates)
@@ -1052,8 +1136,8 @@ def run_video():
 
     scene_audio = []
     for blk, pcm, r in zip(blocks, raw, rates):
-        factor = max(0.8, min(1.25, target / r))
-        if abs(factor - 1) > 0.03:
+        factor = max(0.92, min(1.08, target / r))
+        if abs(factor - 1) > 0.05:
             pcm = change_tempo(pcm, factor)
         segs = split_block(pcm, [s["narration"] for s in blk])
         segs[-1] += b"\x00\x00" * int(SR * 0.2)
@@ -1097,11 +1181,12 @@ def run_video():
     subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "list.txt",
                     "-c", "copy", "video_noaudio.mp4"], check=True, capture_output=True)
 
-    # ---- music + mix ----
+    # ---- music + sfx + mix ----
     subprocess.run(["ffmpeg", "-y", "-i", "voice.wav", "-af", "loudnorm=I=-16:TP=-1.5:LRA=7",
                     "-b:a", "192k", "voiceover.mp3"], check=True, capture_output=True)
     bgm = make_bgm(total + 1, files)
-    final_mix(total, bgm)
+    sfx = build_sfx(scenes, scene_audio, total) if SFX_ON else None
+    final_mix(total, bgm, sfx)
     subprocess.run(["ffmpeg", "-y", "-i", bgm, "-b:a", "192k", "background_music.mp3"],
                    check=True, capture_output=True)
 
