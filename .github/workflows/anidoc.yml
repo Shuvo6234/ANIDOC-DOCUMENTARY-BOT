@@ -44,6 +44,16 @@ jobs:
           GEMINI_TRANSIENT_COOLDOWN_SEC: "15"
           TEXT_MODELS: "gemini-3.1-flash-lite,gemini-3.5-flash-lite"
           TTS_MODELS: "gemini-3.8-flash-tts"
+          # --- sync: ছোট block = নিখুঁত sync (1 = প্রতি scene আলাদা TTS) ---
+          BLOCK_CHARS: "300"
+          SCENE_CHARS: "60"
+          # --- audio mix ---
+          BGM_MOOD: "cinematic"
+          BGM_VOL: "0.30"
+          LUFS: "-14"
+          # --- sound effects (0 দিলে বন্ধ) ---
+          SFX: "1"
+          SFX_VOL: "0.5"
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GDRIVE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
