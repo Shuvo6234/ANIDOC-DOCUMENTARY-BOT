@@ -31,7 +31,9 @@ IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "16:9")
 
 # প্রতি TTS block-এ সর্বোচ্চ কত অক্ষর। ছোট = sync বেশি নিখুঁত (API call বেশি)।
 # BLOCK_CHARS=1 দিলে প্রতিটা scene আলাদা TTS হবে (100% exact sync)।
-BLOCK_CHARS = int(os.getenv("BLOCK_CHARS", "300"))
+BLOCK_CHARS = int(os.getenv("BLOCK_CHARS", "240"))
+# প্রথম কয়েকটা block-এর গতিকে মাপকাঠি ধরে সব scene সেই গতিতে আনা হয়; <1 = আরও ধীর (documentary-সুলভ)
+VOICE_SPEED = float(os.getenv("VOICE_SPEED", "0.95"))
 
 # ---- music / mix সেটিং ----
 BGM_MOOD = os.getenv("BGM_MOOD", "cinematic")   # cinematic | dark | calm | epic
@@ -41,8 +43,8 @@ LUFS = os.getenv("LUFS", "-14")                 # YouTube-এর জন্য -1
 SFX_ON = os.getenv("SFX", "1") == "1"
 SFX_VOL = float(os.getenv("SFX_VOL", "0.5"))
 # ---- নীরবতা কমানো ----
-MAX_PAUSE = float(os.getenv("MAX_PAUSE", "0.30"))
-MIN_PAUSE_RUN = float(os.getenv("MIN_PAUSE_RUN", "0.45"))
+MAX_PAUSE = float(os.getenv("MAX_PAUSE", "0.18"))
+MIN_PAUSE_RUN = float(os.getenv("MIN_PAUSE_RUN", "0.25"))
 
 PDF_PATH = "ANIDOC MAGICAL PROMPT v4.pdf"
 TEXT_MODELS = os.getenv(
@@ -548,13 +550,17 @@ def run_prompts():
 # MODE 2: audio + sync + edit + music + sfx → final_video.mp4
 # =====================================================================
 SR, FPS, W, H = 24000, 25, 1920, 1080
-STYLE = ("calm, deep and authoritative documentary narrator, "
-         "speaking slowly at a steady, measured pace with a serious cinematic tone, "
-         "warm, rich, natural, not robotic, consistent energy, emphasis on dramatic words")
+STYLE = ("professional premium documentary narrator, like a BBC or Netflix history and science documentary: "
+         "deep, calm, warm and authoritative voice, slow steady measured pace that never speeds up, "
+         "exactly the same tone, pitch and energy from the first word to the last, "
+         "controlled dramatic emphasis on key words, short natural pauses only at sentence ends, "
+         "no excitement, no casual conversational tone, not robotic")
 LEGACY_PREFIX = (
-    "Read the following text aloud as a deep, calm, authoritative documentary narrator, "
-    "slow and steady pace, serious tone, warm and natural, not robotic. "
-    "Do not read these instructions:\n")
+    "Read the following text aloud as a professional premium documentary narrator (BBC / Netflix style): "
+    "deep, calm, warm, authoritative; slow, steady, measured pace that never speeds up; "
+    "identical tone and energy from start to finish; dramatic emphasis on key words; "
+    "short pauses only at sentence ends. Do not read these instructions:\n")
+_LEGACY = False
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
 VID_EXT = (".mp4", ".mov", ".mkv", ".webm")
 AUD_EXT = (".mp3", ".wav", ".m4a", ".aac")
@@ -569,7 +575,8 @@ def to_pcm(data):
 
 
 def tts(client, model, text):
-    if model.startswith("gemini-3.8"):
+    global _LEGACY
+    if model.startswith("gemini-3.8") and not _LEGACY:
         try:
             r = client.models.generate_content(
                 model=model,
@@ -582,15 +589,16 @@ def tts(client, model, text):
         except Exception as e:
             if any(w in str(e).lower() for w in
                    ("validation", "extra_forbidden", "speech_metadata", "voice_config", "unexpected")):
-                print("SDK নতুন schema বোঝেনি, legacy format-এ চেষ্টা...")
+                print("SDK নতুন schema বোঝেনি; এরপর সব block legacy format-এ (tone এক রাখতে)")
+                _LEGACY = True
             else:
                 raise
-    prefix = "" if model.startswith("gemini-3.8") else LEGACY_PREFIX
+    # legacy: style সবসময় prefix-এ থাকে (আগে 3.8-এর fallback-এ style বাদ পড়ত)
     r = client.models.generate_content(
-        model=model, contents=prefix + text,
+        model=model, contents=LEGACY_PREFIX + text,
         config=types.GenerateContentConfig(
             response_modalities=["AUDIO"],
-            temperature=0.3, seed=7,   # block-এ block-এ গলার tone এক রাখতে
+            temperature=0.3, seed=7,
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE)))),
@@ -611,7 +619,18 @@ def frame_rms(pcm):
     return [audioop.rms(pcm[i:i + fl], 2) for i in range(0, len(pcm) - fl + 1, fl)]
 
 
-def active_seconds(pcm, thr=300):
+def speech_thr(pcm):
+    """কথার জোর অনুযায়ী নিজে থেকে নীরবতার threshold ঠিক করে (fixed 300 নয়)।"""
+    r = frame_rms(pcm)
+    if not r:
+        return 150
+    loud = sorted(r)[int(len(r) * 0.7):]
+    ref = statistics.median(loud) if loud else 0
+    return max(120, 0.12 * ref)
+
+
+def active_seconds(pcm, thr=None):
+    thr = speech_thr(pcm) if thr is None else thr
     return max(sum(1 for v in frame_rms(pcm) if v > thr) * 0.02, 0.1)
 
 
@@ -619,7 +638,8 @@ def speech_chars(t):
     return len(re.sub(r"\s+", "", t))
 
 
-def trim_pauses(pcm, thr=300, min_run=None, keep=None):
+def trim_pauses(pcm, thr=None, min_run=None, keep=None):
+    thr = speech_thr(pcm) if thr is None else thr
     min_run = MIN_PAUSE_RUN if min_run is None else min_run
     keep = MAX_PAUSE if keep is None else keep
     fl = int(SR * 0.02) * 2
@@ -641,10 +661,10 @@ def trim_pauses(pcm, thr=300, min_run=None, keep=None):
         run = j - i
         edge = i == 0 or j == n
         if edge:
-            k = min(run, int(0.08 / 0.02))
+            k = min(run, int(0.06 / 0.02))
             seg = pcm[i * fl:(i + k) * fl] if i == 0 else pcm[(j - k) * fl:j * fl]
         elif run > min_f:
-            h = keep_f // 2
+            h = max(keep_f // 2, 1)
             seg = pcm[i * fl:(i + h) * fl] + pcm[(j - h) * fl:j * fl]
         else:
             seg = pcm[i * fl:j * fl]
@@ -669,9 +689,10 @@ def split_block(pcm, texts):
     if len(texts) == 1:
         return [pcm]
     r = frame_rms(pcm)
+    thr = speech_thr(pcm)
     fl = int(SR * 0.02) * 2
     n = len(r)
-    act = [i for i, v in enumerate(r) if v > 300]
+    act = [i for i, v in enumerate(r) if v > thr]
     K = len(texts) - 1
     if not act:
         cuts = [n * (k + 1) // len(texts) for k in range(K)]
@@ -679,11 +700,11 @@ def split_block(pcm, texts):
         a, b = act[0], act[-1] + 1
         runs, i = [], a
         while i < b:
-            if r[i] <= 300:
+            if r[i] <= thr:
                 j = i
-                while j < b and r[j] <= 300:
+                while j < b and r[j] <= thr:
                     j += 1
-                if j - i >= 4:
+                if j - i >= 3:
                     runs.append(((i + j) // 2, j - i))
                 i = j
             else:
@@ -1128,20 +1149,26 @@ def run_video():
     after = sum(len(p) for p in raw) / (2 * SR)
     print(f"নীরবতা ছাঁটা: {before:.0f}s -> {after:.0f}s ({before - after:.0f}s কমেছে)")
 
-    # ---- গতি সমান করা (হালকা, যাতে tone না বদলায়) ----
+    # ---- গতি সমান করা: প্রথম block-এর গতি = মাপকাঠি; block, তারপর scene ধরে ঠিক করা ----
     texts_b = [" ".join(s["narration"] for s in blk) for blk in blocks]
     rates = [speech_chars(t) / active_seconds(p) for t, p in zip(texts_b, raw)]
-    target = statistics.median(rates)
+    ref = statistics.median(rates[:min(3, len(rates))])
+    target = ref * VOICE_SPEED
     print("গতি (অক্ষর/সেকেন্ড):", [round(r, 1) for r in rates], "target:", round(target, 1))
 
     scene_audio = []
     for blk, pcm, r in zip(blocks, raw, rates):
-        factor = max(0.92, min(1.08, target / r))
-        if abs(factor - 1) > 0.05:
+        factor = max(0.8, min(1.25, target / r))
+        if abs(factor - 1) > 0.03:
             pcm = change_tempo(pcm, factor)
         segs = split_block(pcm, [s["narration"] for s in blk])
-        segs[-1] += b"\x00\x00" * int(SR * 0.2)
-        scene_audio += segs
+        for s, seg in zip(blk, segs):
+            rate = speech_chars(s["narration"]) / active_seconds(seg)
+            f2 = max(0.9, min(1.1, target / rate))
+            if abs(f2 - 1) > 0.04 and len(seg) > SR * 2:
+                seg = change_tempo(seg, f2)
+            seg = normalize(trim_pauses(seg))       # নীরবতা ছাঁটা + প্রতি scene-এ সমান volume
+            scene_audio.append(seg + b"\x00\x00" * int(SR * 0.05))
 
     durs = [len(s) / (2 * SR) for s in scene_audio]
     print(f"scene দৈর্ঘ্য: min {min(durs):.1f}s, গড় {statistics.mean(durs):.1f}s, max {max(durs):.1f}s "
