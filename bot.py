@@ -20,6 +20,9 @@ IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "16:9")
 BGM_MOOD = os.getenv("BGM_MOOD", "cinematic")   # cinematic | dark | calm | epic
 BGM_VOL = float(os.getenv("BGM_VOL", "0.45"))   # 0.2 (খুব মৃদু) - 0.8 (জোরালো)
 LUFS = os.getenv("LUFS", "-14")                 # YouTube-এর জন্য -14
+# ---- নীরবতা কমানো ----
+MAX_PAUSE = float(os.getenv("MAX_PAUSE", "0.30"))        # লম্বা বিরতি ছেঁটে এতটা রাখে (সেকেন্ড)
+MIN_PAUSE_RUN = float(os.getenv("MIN_PAUSE_RUN", "0.45"))  # এর চেয়ে লম্বা নীরবতাই শুধু ছাঁটা হবে
 
 PDF_PATH = "ANIDOC MAGICAL PROMPT v4.pdf"
 TEXT_MODELS = os.getenv(
@@ -506,6 +509,43 @@ def speech_chars(t):
     return len(re.sub(r"\s+", "", t))
 
 
+def trim_pauses(pcm, thr=300, min_run=None, keep=None):
+    """TTS-এর লম্বা নীরবতা ছোট করে। min_run সেকেন্ডের বেশি লম্বা নীরবতা কেটে keep সেকেন্ড রাখে
+    (দুই পাশে অর্ধেক করে, যাতে কথা কেটে না যায়)। শুরু ও শেষের নীরবতাও ছাঁটে।"""
+    min_run = MIN_PAUSE_RUN if min_run is None else min_run
+    keep = MAX_PAUSE if keep is None else keep
+    fl = int(SR * 0.02) * 2
+    n = len(pcm) // fl
+    sil = [audioop.rms(pcm[i * fl:(i + 1) * fl], 2) <= thr for i in range(n)]
+    out, i = [], 0
+    min_f, keep_f = int(min_run / 0.02), int(keep / 0.02)
+    while i < n:
+        if not sil[i]:
+            j = i
+            while j < n and not sil[j]:
+                j += 1
+            out.append(pcm[i * fl:j * fl])
+            i = j
+            continue
+        j = i
+        while j < n and sil[j]:
+            j += 1
+        run = j - i
+        edge = i == 0 or j == n
+        if edge:
+            k = min(run, int(0.08 / 0.02))          # শুরু/শেষে সর্বোচ্চ 0.08 সেকেন্ড
+            seg = pcm[i * fl:(i + k) * fl] if i == 0 else pcm[(j - k) * fl:j * fl]
+        elif run > min_f:
+            h = keep_f // 2
+            seg = pcm[i * fl:(i + h) * fl] + pcm[(j - h) * fl:j * fl]
+        else:
+            seg = pcm[i * fl:j * fl]
+        out.append(seg)
+        i = j
+    out.append(pcm[n * fl:])
+    return b"".join(out)
+
+
 def change_tempo(pcm, factor):
     open("t_in.raw", "wb").write(pcm)
     subprocess.run(
@@ -582,7 +622,8 @@ def match_media(files, scenes):
     os.makedirs("media", exist_ok=True)
     info = {}
     for f in media:
-        p = os.path.join("media", f"{f['id'][:8]}_{re.sub(r'[^\w.]+', '_', f['name'])}")
+        safe = re.sub(r"[^\w.]+", "_", f["name"])
+        p = os.path.join("media", f"{f['id'][:8]}_{safe}")
         d_download(f["id"], p)
         info[f["id"]] = {"name": f["name"], "path": p,
                          "video": f["name"].lower().endswith(VID_EXT)}
@@ -856,6 +897,11 @@ def run_video():
             time.sleep(5)
         raw.append(pcm)
 
+    before = sum(len(p) for p in raw) / (2 * SR)
+    raw = [trim_pauses(p) for p in raw]
+    after = sum(len(p) for p in raw) / (2 * SR)
+    print(f"নীরবতা ছাঁটা: {before:.0f}s -> {after:.0f}s ({before - after:.0f}s কমেছে)")
+
     # ---- গতি সমান করা ----
     texts_b = [" ".join(s["narration"] for s in blk) for blk in blocks]
     rates = [speech_chars(t) / active_seconds(p) for t, p in zip(texts_b, raw)]
@@ -868,7 +914,7 @@ def run_video():
         if abs(factor - 1) > 0.03:
             pcm = change_tempo(pcm, factor)
         segs = split_block(pcm, [s["narration"] for s in blk])
-        segs[-1] += b"\x00\x00" * int(SR * 0.3)
+        segs[-1] += b"\x00\x00" * int(SR * 0.2)
         scene_audio += segs
 
     durs = [len(s) / (2 * SR) for s in scene_audio]
