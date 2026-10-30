@@ -1,10 +1,24 @@
-import os, re, io, sys, json, wave, time, hashlib, datetime, subprocess, audioop, statistics
+import os, re, io, sys, json, wave, time, hashlib, datetime, subprocess, audioop, statistics, threading, zipfile
 from google import genai
 from google.genai import types
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+
+# log সঙ্গে সঙ্গে দেখানোর জন্য (GitHub Actions-এ নইলে output আটকে থাকে)
+sys.stdout.reconfigure(line_buffering=True)
+MAX_RUN_MIN = int(os.getenv("MAX_RUN_MIN", "45"))
+
+
+def _watchdog():
+    print(f"!!! {MAX_RUN_MIN} মিনিটে শেষ হয়নি, বন্ধ করা হলো (Gemini key/quota বা network সমস্যা হতে পারে)")
+    os._exit(2)
+
+
+_wd = threading.Timer(MAX_RUN_MIN * 60, _watchdog)
+_wd.daemon = True
+_wd.start()
 
 MODE = (os.getenv("MODE") or "prompts").strip()
 TOPIC = (os.getenv("TOPIC") or "").strip()
@@ -112,7 +126,7 @@ class Rotator:
         self.keys = list(enumerate(keys, 1))
         self.i = 0
 
-    def call(self, fn, rounds=6):
+    def call(self, fn, rounds=int(os.getenv("GEMINI_ROUNDS", "3"))):
         last = None
         for rnd in range(1, rounds + 1):
             tried = 0
@@ -120,7 +134,8 @@ class Rotator:
                 self.i %= len(self.keys)
                 no, key = self.keys[self.i]
                 client = genai.Client(
-                    api_key=key, http_options=types.HttpOptions(timeout=300000))
+                    api_key=key, http_options=types.HttpOptions(timeout=int(os.getenv("GEMINI_TIMEOUT_MS", "120000"))))
+                print(f"→ Gemini call, key {no}/{TOTAL}, round {rnd}")
                 try:
                     return fn(client)
                 except Exception as e:
@@ -154,6 +169,7 @@ rot = Rotator(KEYS)
 def with_models(models, fn):
     last = None
     for m in list(models):
+        print(f"Model: {m}")
         try:
             result = rot.call(lambda c: fn(c, m))
             models.remove(m)
@@ -613,13 +629,15 @@ def make_thumb(path, is_video, out):
 def match_media(files, scenes):
     """ছবি/clip নামিয়ে AI দিয়ে scene-এর সাথে মেলায়। রিটার্ন: প্রতি scene-এর জন্য [ {path, video, name} ]"""
     n_scenes = len(scenes)
-    media = [f for f in files if f["name"].lower().endswith(IMG_EXT + VID_EXT)
-             and not f["name"].lower().startswith(("thumb", "final", "bgm"))]
-    if not media:
-        sys.exit("project folder-এ কোনো ছবি/video পাওয়া যায়নি")
-    media.sort(key=lambda x: x["createdTime"])  # upload-এর ক্রম
+    def ok_name(nm):
+        low = nm.lower()
+        return low.endswith(IMG_EXT + VID_EXT) and not low.startswith(("thumb", "final", "bgm", "."))
+
+    def nat(nm):
+        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", nm)]
 
     os.makedirs("media", exist_ok=True)
+    media = [f for f in files if ok_name(f["name"])]
     info = {}
     for f in media:
         safe = re.sub(r"[^\w.]+", "_", f["name"])
@@ -627,6 +645,38 @@ def match_media(files, scenes):
         d_download(f["id"], p)
         info[f["id"]] = {"name": f["name"], "path": p,
                          "video": f["name"].lower().endswith(VID_EXT)}
+
+    # ---- zip ফাইল: নামিয়ে খুলে ভেতরের ছবি/clip যোগ করা ----
+    seen_names = {f["name"] for f in media}
+    for z in [f for f in files if f["name"].lower().endswith(".zip")]:
+        zp = f"media_{z['id'][:8]}.zip"
+        d_download(z["id"], zp)
+        added = 0
+        with zipfile.ZipFile(zp) as zf:
+            entries = sorted((e for e in zf.infolist() if not e.is_dir()
+                              and "__MACOSX" not in e.filename
+                              and ok_name(os.path.basename(e.filename))),
+                             key=lambda e: nat(e.filename))
+            for k, e in enumerate(entries):
+                base = os.path.basename(e.filename)
+                nm = base
+                if nm in seen_names:  # ভিন্ন subfolder-এ একই নাম থাকলে আলাদা করা
+                    stem, ext = os.path.splitext(base)
+                    nm = f"{stem}_{z['id'][:4]}{k}{ext}"
+                seen_names.add(nm)
+                fid = f"{z['id'][:8]}z{k:05d}"
+                p = os.path.join("media", fid + "_" + re.sub(r"[^A-Za-z0-9.]+", "_", nm))
+                with zf.open(e) as src, open(p, "wb") as dst:
+                    dst.write(src.read())
+                media.append({"id": fid, "name": nm, "createdTime": z["createdTime"]})
+                info[fid] = {"name": nm, "path": p, "video": nm.lower().endswith(VID_EXT)}
+                added += 1
+        print(f"zip খোলা হলো: {z['name']} -> {added}টা ছবি/clip")
+        os.remove(zp)
+
+    if not media:
+        sys.exit("project folder-এ কোনো ছবি/video (বা zip-এর ভেতরে) পাওয়া যায়নি")
+    media.sort(key=lambda x: (x["createdTime"], nat(x["name"])))  # upload-এর ক্রম, তারপর নামের ক্রম
     print("মিডিয়া download:", len(media), "টা ফাইল")
 
     # আগের map (হাতে ঠিক করা থাকলে সেটাই)
