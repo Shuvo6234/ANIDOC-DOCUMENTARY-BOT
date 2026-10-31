@@ -4,23 +4,29 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "prompts = script + image prompts | video = audio + final mp4"
+        description: "watch = প্রতি 2 মিনিটে folder দেখে zip পেলে video বানায় | prompts = script + scene prompt | video = একবার চালাও"
         type: choice
         options:
+          - watch
           - prompts
           - video
-        default: prompts
+        default: watch
       topic:
-        description: "Documentary topic (prompts mode-এ লাগবে)"
+        description: "Documentary topic (prompts mode-এ; ফাঁকা রাখলে Google trending থেকে bot নিজে বাছবে)"
         required: false
-      project:
-        description: "Drive project folder-এর নাম (video mode; ফাঁকা = সর্বশেষটা)"
-        required: false
+  # watcher প্রতি ৬ ঘণ্টায় নিজে আবার চালু হয় (একটা শেষ হলে পরেরটা শুরু)
+  schedule:
+    - cron: "0 */6 * * *"
+
+# একই mode একসাথে দুইবার চলবে না; prompts আর watch আলাদা group, তাই একসাথে চলতে পারে
+concurrency:
+  group: anidoc-${{ github.event.inputs.mode || 'watch' }}
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -36,15 +42,25 @@ jobs:
 
       - name: Run bot
         env:
-          MODE: ${{ github.event.inputs.mode }}
+          MODE: ${{ github.event.inputs.mode || 'watch' }}
           TOPIC: ${{ github.event.inputs.topic }}
-          PROJECT: ${{ github.event.inputs.project }}
-          MAX_RUN_MIN: "170"
+          MAX_RUN_MIN: "345"
+          # --- watch ---
+          POLL_SEC: "120"
+          WATCH_MAX_MIN: "330"
+          QUOTA_WAIT_MIN: "60"
+          # --- auto topic: video শেষ হলে mp4 archive করে trending topic-এর নতুন prompt পাঠায় (0 = বন্ধ) ---
+          AUTO_TOPIC: "1"
+          TREND_GEO: "IN"
+          ARCHIVE_FOLDER: "Finished_Videos"
+          # --- dialogue clip ধরা (plan = শুধু dialogue plan করা scene-এ) ---
+          DIALOGUE_DETECT: "plan"
+          DIALOGUE_MIN_SEC: "0.8"
           GEMINI_QUOTA_COOLDOWN_SEC: "60"
           GEMINI_TRANSIENT_COOLDOWN_SEC: "15"
           TEXT_MODELS: "gemini-3.1-flash-lite,gemini-3.5-flash-lite"
           TTS_MODELS: "gemini-3.8-flash-tts"
-          # --- sync: ছোট block = নিখুঁত sync (1 = প্রতি scene আলাদা TTS) ---
+          # --- sync ---
           BLOCK_CHARS: "240"
           SCENE_CHARS: "60"
           # --- voice ---
@@ -74,10 +90,7 @@ jobs:
           retention-days: 14
           path: |
             script.txt
-            image_prompts.txt
+            all_prompts.txt
             youtube_package.txt
             scenes.json
             image_map.json
-            voiceover.mp3
-            background_music.mp3
-            final_video.mp4
