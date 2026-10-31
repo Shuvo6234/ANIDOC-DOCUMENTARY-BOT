@@ -33,7 +33,12 @@ jobs:
       - name: Install
         run: |
           pip install -r requirements.txt
-          command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          sudo apt-get update
+          command -v ffmpeg >/dev/null || sudo apt-get install -y ffmpeg
+          # screen text-এর premium font (যেটা পাওয়া যায় না সেটা বাদ, বাকিগুলো ঠিকই বসে)
+          for p in fonts-montserrat fonts-playfair-display fonts-lato fonts-oswald fonts-liberation fonts-dejavu-core; do
+            sudo apt-get install -y "$p" || true
+          done
 
       - name: Run bot
         env:
@@ -71,6 +76,8 @@ jobs:
           # --- scene বদলের transition ---
           TRANSITION_SEC: "0.5"
           TRANSITION: "fade"
+          # সাধারণ fade-এর কত অংশ (0.6 = ৬০%) premium style (dissolve/smooth/iris/wipe/reveal/push/graydip) হবে; 0 = বন্ধ
+          TRANSITION_MIX: "0.6"
           TRANS_SFX: "1"
           TRANS_SFX_VOL: "0.55"
           CLIP_AUDIO_VOL: "0.5"
