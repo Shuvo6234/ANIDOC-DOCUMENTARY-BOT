@@ -62,6 +62,8 @@ jobs:
           GEMINI_TRANSIENT_COOLDOWN_SEC: "15"
           TEXT_MODELS: "gemini-3.1-flash-lite,gemini-3.5-flash-lite"
           TTS_MODELS: "gemini-3.8-flash-tts"
+          # --- Flow agent এক বারে কত scene করবে (Flow limit 24, তাই 20) ---
+          FLOW_BATCH: "20"
           # --- sync ---
           BLOCK_CHARS: "240"
           SCENE_CHARS: "60"
@@ -76,6 +78,13 @@ jobs:
           # --- sound effects (0 দিলে বন্ধ) ---
           SFX: "1"
           SFX_VOL: "0.5"
+          # --- scene বদলের transition (TRANSITION_SEC 0 দিলে বন্ধ; TRANSITION: fade | fadeblack | dissolve, comma দিয়ে পালা করেও দেওয়া যায়) ---
+          TRANSITION_SEC: "0.5"
+          TRANSITION: "fade"
+          TRANS_SFX: "1"
+          TRANS_SFX_VOL: "0.55"
+          # --- Flow/Veo clip-এর নিজের sound (ambient/পায়ের শব্দ ইত্যাদি) narration-এর নিচে মেশানো (0 = বন্ধ) ---
+          CLIP_AUDIO_VOL: "0.5"
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GDRIVE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
