@@ -4,23 +4,23 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "watch = প্রতি 2 মিনিটে folder দেখে zip পেলে video বানায় | prompts = script + scene prompt | video = একবার চালাও"
+        description: "once = একবার folder দেখে কাজ থাকলে করে (cron-এর মতো) | prompts = script + prompt | video = zip থাকলে video বানাও"
         type: choice
         options:
-          - watch
+          - once
           - prompts
           - video
-        default: watch
+        default: once
       topic:
         description: "Documentary topic (prompts mode-এ; ফাঁকা রাখলে Google trending থেকে bot নিজে বাছবে)"
         required: false
-  # watcher প্রতি ৬ ঘণ্টায় নিজে আবার চালু হয় (একটা শেষ হলে পরেরটা শুরু)
+  # প্রতি ১৫ মিনিটে GitHub নিজে চালায়: folder-এ zip থাকলে video বানায়, video শেষ হলে নতুন prompt পাঠায়, কাজ না থাকলে সঙ্গে সঙ্গে বেরিয়ে যায়
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "*/15 * * * *"
 
-# একই mode একসাথে দুইবার চলবে না; prompts আর watch আলাদা group, তাই একসাথে চলতে পারে
+# একই mode একসাথে দুইবার চলবে না (video বানাতে বেশি সময় লাগলে পরের cron অপেক্ষা করে, দুটো একসাথে চলে না)
 concurrency:
-  group: anidoc-${{ github.event.inputs.mode || 'watch' }}
+  group: anidoc-${{ github.event.inputs.mode || 'once' }}
   cancel-in-progress: false
 
 jobs:
@@ -29,23 +29,22 @@ jobs:
     timeout-minutes: 350
     permissions:
       contents: read
-      actions: write   # watcher শেষ হলে নিজেই নতুন watcher চালু করার জন্য
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install
         run: |
           pip install -r requirements.txt
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
 
       - name: Run bot
         env:
-          MODE: ${{ github.event.inputs.mode || 'watch' }}
+          MODE: ${{ github.event.inputs.mode || 'once' }}
           TOPIC: ${{ github.event.inputs.topic }}
           MAX_RUN_MIN: "345"
           # --- watch ---
@@ -98,11 +97,3 @@ jobs:
             youtube_package.txt
             scenes.json
             image_map.json
-
-      # watcher (৫.৫ ঘণ্টা) স্বাভাবিকভাবে শেষ হলে সঙ্গে সঙ্গে নতুন watcher চালু করে।
-      # (GitHub-এর একটা job সর্বোচ্চ ৬ ঘণ্টা চলে, তাই ৩০ মিনিট হাতে রেখে বদলি শুরু হয়)
-      - name: Restart watcher
-        if: success() && (github.event_name == 'schedule' || github.event.inputs.mode == 'watch')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run "$GITHUB_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f mode=watch
