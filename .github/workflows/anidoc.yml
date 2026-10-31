@@ -93,7 +93,8 @@ jobs:
           retention-days: 14
           path: |
             script.txt
-            all_prompts.txt
+            all_image_prompts.txt
+            all_video_prompts.txt
             youtube_package.txt
             scenes.json
             image_map.json
