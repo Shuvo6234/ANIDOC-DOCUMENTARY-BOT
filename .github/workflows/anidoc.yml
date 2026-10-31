@@ -14,11 +14,9 @@ on:
       topic:
         description: "Documentary topic (prompts mode-এ; ফাঁকা রাখলে Google trending থেকে bot নিজে বাছবে)"
         required: false
-  # প্রতি ১৫ মিনিটে GitHub নিজে চালায়: folder-এ zip থাকলে video বানায়, video শেষ হলে নতুন prompt পাঠায়, কাজ না থাকলে সঙ্গে সঙ্গে বেরিয়ে যায়
   schedule:
     - cron: "*/15 * * * *"
 
-# একই mode একসাথে দুইবার চলবে না (video বানাতে বেশি সময় লাগলে পরের cron অপেক্ষা করে, দুটো একসাথে চলে না)
 concurrency:
   group: anidoc-${{ github.event.inputs.mode || 'once' }}
   cancel-in-progress: false
@@ -47,43 +45,39 @@ jobs:
           MODE: ${{ github.event.inputs.mode || 'once' }}
           TOPIC: ${{ github.event.inputs.topic }}
           MAX_RUN_MIN: "345"
-          # --- watch ---
           POLL_SEC: "120"
           WATCH_MAX_MIN: "330"
           QUOTA_WAIT_MIN: "60"
-          # --- auto topic: video শেষ হলে mp4 archive করে trending topic-এর নতুন prompt পাঠায় (0 = বন্ধ) ---
           AUTO_TOPIC: "1"
           TREND_GEO: "IN"
           ARCHIVE_FOLDER: "Finished_Videos"
-          # --- dialogue clip ধরা (plan = শুধু dialogue plan করা scene-এ) ---
           DIALOGUE_DETECT: "plan"
           DIALOGUE_MIN_SEC: "0.8"
           GEMINI_QUOTA_COOLDOWN_SEC: "60"
           GEMINI_TRANSIENT_COOLDOWN_SEC: "15"
           TEXT_MODELS: "gemini-3.1-flash-lite,gemini-3.5-flash-lite"
           TTS_MODELS: "gemini-3.8-flash-tts"
-          # --- Flow agent এক বারে কত scene করবে (Flow limit 24, তাই 20) ---
           FLOW_BATCH: "20"
-          # --- sync ---
           BLOCK_CHARS: "240"
           SCENE_CHARS: "60"
-          # --- voice ---
           VOICE_SPEED: "0.95"
           MAX_PAUSE: "0.18"
           MIN_PAUSE_RUN: "0.25"
-          # --- audio mix ---
           BGM_MOOD: "cinematic"
           BGM_VOL: "0.30"
           LUFS: "-14"
-          # --- sound effects (0 দিলে বন্ধ) ---
+          # --- sound effects (0 দিলে সব বন্ধ) ---
           SFX: "1"
           SFX_VOL: "0.5"
-          # --- scene বদলের transition (TRANSITION_SEC 0 দিলে বন্ধ; TRANSITION: fade | fadeblack | dissolve, comma দিয়ে পালা করেও দেওয়া যায়) ---
+          # --- নিজের sound library: Drive-এ pack*.mp3 বা Sounds folder থাকলে নিজে কেটে চিনে বসায় (0 = বন্ধ) ---
+          SOUND_LIB: "1"
+          LIB_SILENCE_DB: "-38,-32,-26,-20"
+          # --- scene বদলের transition: scene-এ AI-র বাছা style (flash/zoom/blur/glitch/whip/fadeblack/dissolve/fade) ব্যবহার হয়;
+          #     না থাকলে নিচের তালিকা পালা করে। TRANSITION_SEC 0 দিলে transition বন্ধ ---
           TRANSITION_SEC: "0.5"
           TRANSITION: "fade"
           TRANS_SFX: "1"
           TRANS_SFX_VOL: "0.55"
-          # --- Flow/Veo clip-এর নিজের sound (ambient/পায়ের শব্দ ইত্যাদি) narration-এর নিচে মেশানো (0 = বন্ধ) ---
           CLIP_AUDIO_VOL: "0.5"
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GDRIVE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
