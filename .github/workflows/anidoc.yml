@@ -4,18 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "once = একবার folder দেখে কাজ থাকলে করে (cron-এর মতো) | prompts = script + prompt | video = zip থাকলে video বানাও"
+        description: "once = একবার folder দেখে কাজ থাকলে করে (cron-এর মতো) | prompts = script + prompt | video = zip থাকলে video বানাও | watch = ৫ ঘণ্টা ধরে প্রতি ২ মিনিটে folder দেখে"
         type: choice
         options:
           - once
           - prompts
           - video
+          - watch
         default: once
       topic:
         description: "Documentary topic (prompts mode-এ; ফাঁকা রাখলে Google trending থেকে bot নিজে বাছবে)"
         required: false
   schedule:
-    - cron: "*/15 * * * *"
+    # ব্যস্ত মিনিট (0, 15, 30, 45) এড়ানো হয়েছে, যাতে GitHub-এর দেরি কম হয়
+    - cron: "7,22,37,52 * * * *"
 
 concurrency:
   group: anidoc-${{ github.event.inputs.mode || 'once' }}
@@ -72,13 +74,15 @@ jobs:
           # --- নিজের sound library: Drive-এ pack*.mp3 বা Sounds folder থাকলে নিজে কেটে চিনে বসায় (0 = বন্ধ) ---
           SOUND_LIB: "1"
           LIB_SILENCE_DB: "-38,-32,-26,-20"
-          # --- scene বদলের transition: scene-এ AI-র বাছা style (flash/zoom/blur/glitch/whip/fadeblack/dissolve/fade) ব্যবহার হয়;
-          #     না থাকলে নিচের তালিকা পালা করে। TRANSITION_SEC 0 দিলে transition বন্ধ ---
+          # --- scene বদলের transition ---
           TRANSITION_SEC: "0.5"
           TRANSITION: "fade"
           TRANS_SFX: "1"
           TRANS_SFX_VOL: "0.55"
           CLIP_AUDIO_VOL: "0.5"
+          # --- পর্দায় premium style ইংরেজি text (0 = বন্ধ) ---
+          SCREEN_TEXT: "1"
+          TEXT_SIZE: "58"
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GDRIVE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
