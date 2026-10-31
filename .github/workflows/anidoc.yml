@@ -3,24 +3,17 @@ name: ANIDOC Hindi Documentary
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "once = একবার folder দেখে কাজ থাকলে করে (cron-এর মতো) | prompts = script + prompt | video = zip থাকলে video বানাও | watch = ৫ ঘণ্টা ধরে প্রতি ২ মিনিটে folder দেখে"
-        type: choice
-        options:
-          - once
-          - prompts
-          - video
-          - watch
-        default: once
       topic:
-        description: "Documentary topic (prompts mode-এ; ফাঁকা রাখলে Google trending থেকে bot নিজে বাছবে)"
+        description: "Documentary topic (ফাঁকা রাখলে bot Google trending থেকে নিজে বাছবে; folder-এ আগের কাজ চললে topic ব্যবহার হবে না)"
         required: false
+        default: ""
   schedule:
-    # ব্যস্ত মিনিট (0, 15, 30, 45) এড়ানো হয়েছে, যাতে GitHub-এর দেরি কম হয়
+    # প্রতি ১৫ মিনিটে; ব্যস্ত মিনিট (0, 15, 30, 45) এড়ানো হয়েছে, যাতে GitHub-এর দেরি কম হয়
     - cron: "7,22,37,52 * * * *"
 
+# একসাথে দুটো run চললে একই কাজ দুবার হয়ে যেত; তাই একটা শেষ হলে তবেই পরেরটা শুরু
 concurrency:
-  group: anidoc-${{ github.event.inputs.mode || 'once' }}
+  group: anidoc
   cancel-in-progress: false
 
 jobs:
@@ -44,7 +37,8 @@ jobs:
 
       - name: Run bot
         env:
-          MODE: ${{ github.event.inputs.mode || 'once' }}
+          # একটাই mode: আগে Drive folder দেখে; zip+prompt থাকলে video বানায়, folder ফাঁকা থাকলে নতুন prompt বানায়, নইলে কিছু না করে বেরিয়ে যায়
+          MODE: "once"
           TOPIC: ${{ github.event.inputs.topic }}
           MAX_RUN_MIN: "345"
           POLL_SEC: "120"
@@ -71,7 +65,7 @@ jobs:
           # --- sound effects (0 দিলে সব বন্ধ) ---
           SFX: "1"
           SFX_VOL: "0.5"
-          # --- নিজের sound library: Drive-এ pack*.mp3 বা Sounds folder থাকলে নিজে কেটে চিনে বসায় (0 = বন্ধ) ---
+          # --- নিজের sound library: Music_SFX_Library-তে sfx_*.wav/mp3, pack*.mp3 বা Sounds folder থাকলে বসায় (0 = বন্ধ) ---
           SOUND_LIB: "1"
           LIB_SILENCE_DB: "-38,-32,-26,-20"
           # --- scene বদলের transition ---
@@ -83,11 +77,11 @@ jobs:
           # --- পর্দায় premium style ইংরেজি text (0 = বন্ধ) ---
           SCREEN_TEXT: "1"
           TEXT_SIZE: "58"
-          # --- video শেষে final mp4 ছাড়া সব স্থায়ীভাবে মোছা (0 = বন্ধ); নিজের গান/sfx Music_SFX_Library folder-এ থাকে, কখনো মোছা হয় না ---
+          # --- video শেষে final mp4 + youtube_package.txt ছাড়া সব স্থায়ীভাবে মোছা; Music_SFX_Library কখনো মোছা হয় না ---
           CLEAN_AFTER_VIDEO: "1"
           KEEP_YT_PACKAGE: "1"
           LIBRARY_FOLDER: "Music_SFX_Library"
-          # --- Blogger: topic তালিকা শুধু Blogger-এর draft page-এ। Blogger না চললে bot থামে আর পরে নিজে আবার চেষ্টা করে ---
+          # --- Blogger: topic তালিকা শুধু Blogger-এর draft page-এ। Blogger না চললে bot থামে আর পরের run নিজে আবার চেষ্টা করে ---
           BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
           BLOGGER_WAIT_MIN: "10"
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
