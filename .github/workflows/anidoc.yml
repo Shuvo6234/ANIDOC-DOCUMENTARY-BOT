@@ -51,7 +51,7 @@ jobs:
           WATCH_MAX_MIN: "330"
           QUOTA_WAIT_MIN: "60"
           AUTO_TOPIC: "1"
-          TREND_GEO: "IN"
+          TREND_GEOS: "BD,PK,IN"
           ARCHIVE_FOLDER: "Finished_Videos"
           DIALOGUE_DETECT: "plan"
           DIALOGUE_MIN_SEC: "0.8"
@@ -83,6 +83,13 @@ jobs:
           # --- পর্দায় premium style ইংরেজি text (0 = বন্ধ) ---
           SCREEN_TEXT: "1"
           TEXT_SIZE: "58"
+          # --- video শেষে final mp4 ছাড়া সব স্থায়ীভাবে মোছা (0 = বন্ধ); নিজের গান/sfx Music_SFX_Library folder-এ থাকে, কখনো মোছা হয় না ---
+          CLEAN_AFTER_VIDEO: "1"
+          KEEP_YT_PACKAGE: "1"
+          LIBRARY_FOLDER: "Music_SFX_Library"
+          # --- Blogger: topic তালিকা শুধু Blogger-এর draft page-এ। Blogger না চললে bot থামে আর পরে নিজে আবার চেষ্টা করে ---
+          BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
+          BLOGGER_WAIT_MIN: "10"
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GDRIVE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
