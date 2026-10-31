@@ -27,6 +27,9 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    permissions:
+      contents: read
+      actions: write   # watcher শেষ হলে নিজেই নতুন watcher চালু করার জন্য
     steps:
       - uses: actions/checkout@v4
 
@@ -94,3 +97,11 @@ jobs:
             youtube_package.txt
             scenes.json
             image_map.json
+
+      # watcher (৫.৫ ঘণ্টা) স্বাভাবিকভাবে শেষ হলে সঙ্গে সঙ্গে নতুন watcher চালু করে।
+      # (GitHub-এর একটা job সর্বোচ্চ ৬ ঘণ্টা চলে, তাই ৩০ মিনিট হাতে রেখে বদলি শুরু হয়)
+      - name: Restart watcher
+        if: success() && (github.event_name == 'schedule' || github.event.inputs.mode == 'watch')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run "$GITHUB_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f mode=watch
