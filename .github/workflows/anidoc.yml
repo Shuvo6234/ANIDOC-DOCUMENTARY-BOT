@@ -91,19 +91,6 @@ jobs:
           # --- Blogger: topic তালিকা শুধু Blogger-এর draft page-এ। Blogger না চললে bot থামে আর পরের run নিজে আবার চেষ্টা করে ---
           BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
           BLOGGER_WAIT_MIN: "10"
-          # --- YouTube upload ---
-          # YT_UPLOAD: "0" = video শুধু Drive folder-এ যায় (audit approve না হওয়া পর্যন্ত এটাই রাখো)
-          # YT_UPLOAD: "1" = Drive-এ রাখার পরে youtube_package.txt থেকে title/description/tags নিয়ে নিজের channel-এ upload করে
-          YT_UPLOAD: "0"
-          # private / unlisted / public (শুরুতে private রাখা নিরাপদ)
-          YT_PRIVACY: "private"
-          # pinned comment-এর লেখা comment হিসেবে দেয় (pin নিজে YouTube Studio থেকে করতে হবে); 0 = বন্ধ
-          YT_COMMENT: "1"
-          # 27 = Education
-          YT_CATEGORY: "27"
-          YT_LANG: "hi"
-          # youtube.upload + youtube.force-ssl অনুমতিসহ আলাদা refresh token (না দিলে GOOGLE_OAUTH_REFRESH_TOKEN ব্যবহার হবে)
-          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GDRIVE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
