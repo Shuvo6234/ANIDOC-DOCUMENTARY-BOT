@@ -86,7 +86,13 @@ jobs:
           TEXT_SIZE: "58"
           # --- video শেষে final mp4 + youtube_package.txt ছাড়া সব স্থায়ীভাবে মোছা; Music_SFX_Library কখনো মোছা হয় না ---
           CLEAN_AFTER_VIDEO: "1"
-          KEEP_YT_PACKAGE: "1"
+          # --- final video export: 2K (2560x1440)। 0 দিলে আগের মতো 1080p; সময় বেশি লাগলে OUT_PRESET veryfast করো ---
+          OUT_W: "2560"
+          OUT_H: "1440"
+          OUT_CRF: "18"
+          OUT_PRESET: "fast"
+          # --- title/description/tags txt যাবে Output-এর বাইরে এই একটা folder-এ (প্রথমবার bot নিজে বানাবে) ---
+          PACKAGES_FOLDER: "Video_Packages"
           LIBRARY_FOLDER: "Music_SFX_Library"
           # --- Blogger: topic তালিকা শুধু Blogger-এর draft page-এ। Blogger না চললে bot থামে আর পরের run নিজে আবার চেষ্টা করে ---
           BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
