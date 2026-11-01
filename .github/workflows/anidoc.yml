@@ -84,7 +84,7 @@ jobs:
           # --- পর্দায় premium style ইংরেজি text (0 = বন্ধ) ---
           SCREEN_TEXT: "1"
           TEXT_SIZE: "58"
-          # --- video শেষে final mp4 + youtube_package.txt ছাড়া সব স্থায়ীভাবে মোছা; Music_SFX_Library কখনো মোছা হয় না ---
+          # --- video শেষে অপ্রয়োজনীয় সব স্থায়ীভাবে মোছা; Music_SFX_Library কখনো মোছা হয় না (0 = পরিষ্কার বন্ধ) ---
           CLEAN_AFTER_VIDEO: "1"
           # --- final video export: 2K (2560x1440)। 0 দিলে আগের মতো 1080p; সময় বেশি লাগলে OUT_PRESET veryfast করো ---
           OUT_W: "2560"
@@ -94,6 +94,11 @@ jobs:
           # --- title/description/tags txt যাবে Output-এর বাইরে এই একটা folder-এ (প্রথমবার bot নিজে বানাবে) ---
           PACKAGES_FOLDER: "Video_Packages"
           LIBRARY_FOLDER: "Music_SFX_Library"
+          # --- YouTube: UniPost দিয়ে সরাসরি আপলোড। সফল হলে Drive-এ থাকে শুধু thumbnail prompt txt;
+          #     ব্যর্থ হলে final video আর youtube_package.txt Drive-এ যায় ---
+          UNIPOST_API_KEY: ${{ secrets.UNIPOST_API_KEY }}
+          UNIPOST_MODE: "publish"
+          UNIPOST_PRIVACY: "unlisted"
           # --- Blogger: topic তালিকা শুধু Blogger-এর draft page-এ। Blogger না চললে bot থামে আর পরের run নিজে আবার চেষ্টা করে ---
           BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
           BLOGGER_WAIT_MIN: "10"
