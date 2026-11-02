@@ -56,8 +56,11 @@ jobs:
           DIALOGUE_MIN_SEC: "0.8"
           GEMINI_QUOTA_COOLDOWN_SEC: "60"
           GEMINI_TRANSIENT_COOLDOWN_SEC: "15"
+          # --- Gemini: voice এখন আর Gemini দিয়ে হয় না (ElevenLabs), তাই শুধু text কাজ ---
+          # সাধারণ কাজ (scene, prompt, package ইত্যাদি): সবচেয়ে ছোট/সস্তা model
           TEXT_MODELS: "gemini-3.1-flash-lite,gemini-3.5-flash-lite"
-          TTS_MODELS: "gemini-3.8-flash-tts"
+          # শুধু script + narration লেখা: একটু ওপরের model আগে; পাওয়া না গেলে (404) নিজে নিচেরটায় নামে
+          SCRIPT_MODELS: "gemini-3.5-flash,gemini-3.1-flash-lite"
           FLOW_BATCH: "20"
           BLOCK_CHARS: "240"
           SCENE_CHARS: "60"
@@ -67,6 +70,15 @@ jobs:
           BGM_MOOD: "cinematic"
           BGM_VOL: "0.30"
           LUFS: "-14"
+          # --- ElevenLabs voiceover (একাধিক key কমা দিয়ে secret-এ রাখো; bot পালা করে ব্যবহার করে) ---
+          ELEVENLABS_API_KEYS: ${{ secrets.ELEVENLABS_API_KEYS }}
+          ELEVEN_VOICE_ID: ${{ secrets.ELEVEN_VOICE_ID }}
+          # eleven_multilingual_v2 = হিন্দিতে ভালো; credit কম খরচ চাইলে eleven_flash_v2_5
+          ELEVEN_MODEL: "eleven_multilingual_v2"
+          # বেশি stability = সব block-এ একই স্বর/টোন
+          ELEVEN_STABILITY: "0.75"
+          ELEVEN_SIMILARITY: "0.80"
+          ELEVEN_STYLE: "0.0"
           # --- sound effects (0 দিলে সব বন্ধ) ---
           SFX: "1"
           SFX_VOL: "0.5"
