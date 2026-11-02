@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       topic:
-        description: "Documentary topic (à¦«à¦¾à¦à¦•à¦¾ à¦°à¦¾à¦–à¦²à§‡ bot Google trending à¦¥à§‡à¦•à§‡ à¦¨à¦¿à¦œà§‡ à¦¬à¦¾à¦›à¦¬à§‡; folder-à¦ à¦†à¦—à§‡à¦° à¦•à¦¾à¦œ à¦šà¦²à¦²à§‡ topic à¦¬à§à¦¯à¦¬à¦¹à¦¾à¦° à¦¹à¦¬à§‡ à¦¨à¦¾)"
+        description: "Documentary topic (ফাঁকা রাখলে bot Google trending থেকে নিজে বাছবে; folder-এ আগের কাজ চললে topic ব্যবহার হবে না)"
         required: false
         default: ""
   schedule:
-    # à¦ªà§à¦°à¦¤à¦¿ à§§à§« à¦®à¦¿à¦¨à¦¿à¦Ÿà§‡; à¦¬à§à¦¯à¦¸à§à¦¤ à¦®à¦¿à¦¨à¦¿à¦Ÿ (0, 15, 30, 45) à¦à¦¡à¦¼à¦¾à¦¨à§‹ à¦¹à¦¯à¦¼à§‡à¦›à§‡, à¦¯à¦¾à¦¤à§‡ GitHub-à¦à¦° à¦¦à§‡à¦°à¦¿ à¦•à¦® à¦¹à¦¯à¦¼
+    # প্রতি ১৫ মিনিটে; ব্যস্ত মিনিট (0, 15, 30, 45) এড়ানো হয়েছে, যাতে GitHub-এর দেরি কম হয়
     - cron: "7,22,37,52 * * * *"
 
-# à¦à¦•à¦¸à¦¾à¦¥à§‡ à¦¦à§à¦Ÿà§‹ run à¦šà¦²à¦²à§‡ à¦à¦•à¦‡ à¦•à¦¾à¦œ à¦¦à§à¦¬à¦¾à¦° à¦¹à¦¯à¦¼à§‡ à¦¯à§‡à¦¤; à¦¤à¦¾à¦‡ à¦à¦•à¦Ÿà¦¾ à¦¶à§‡à¦· à¦¹à¦²à§‡ à¦¤à¦¬à§‡à¦‡ à¦ªà¦°à§‡à¦°à¦Ÿà¦¾ à¦¶à§à¦°à§
+# একসাথে দুটো run চললে একই কাজ দুবার হয়ে যেত; তাই একটা শেষ হলে তবেই পরেরটা শুরু
 concurrency:
   group: anidoc
   cancel-in-progress: false
@@ -35,14 +35,14 @@ jobs:
           pip install -r requirements.txt
           sudo apt-get update
           command -v ffmpeg >/dev/null || sudo apt-get install -y ffmpeg
-          # screen text-à¦à¦° premium font (à¦¯à§‡à¦Ÿà¦¾ à¦ªà¦¾à¦“à¦¯à¦¼à¦¾ à¦¯à¦¾à¦¯à¦¼ à¦¨à¦¾ à¦¸à§‡à¦Ÿà¦¾ à¦¬à¦¾à¦¦, à¦¬à¦¾à¦•à¦¿à¦—à§à¦²à§‹ à¦ à¦¿à¦•à¦‡ à¦¬à¦¸à§‡)
+          # screen text-এর premium font (যেটা পাওয়া যায় না সেটা বাদ, বাকিগুলো ঠিকই বসে)
           for p in fonts-montserrat fonts-playfair-display fonts-lato fonts-oswald fonts-liberation fonts-dejavu-core; do
             sudo apt-get install -y "$p" || true
           done
 
       - name: Run bot
         env:
-          # à¦à¦•à¦Ÿà¦¾à¦‡ mode: à¦†à¦—à§‡ Drive folder à¦¦à§‡à¦–à§‡; zip+prompt à¦¥à¦¾à¦•à¦²à§‡ video à¦¬à¦¾à¦¨à¦¾à¦¯à¦¼, folder à¦«à¦¾à¦à¦•à¦¾ à¦¥à¦¾à¦•à¦²à§‡ à¦¨à¦¤à§à¦¨ prompt à¦¬à¦¾à¦¨à¦¾à¦¯à¦¼, à¦¨à¦‡à¦²à§‡ à¦•à¦¿à¦›à§ à¦¨à¦¾ à¦•à¦°à§‡ à¦¬à§‡à¦°à¦¿à¦¯à¦¼à§‡ à¦¯à¦¾à¦¯à¦¼
+          # একটাই mode: আগে Drive folder দেখে; zip+prompt থাকলে video বানায়, folder ফাঁকা থাকলে নতুন prompt বানায়, নইলে কিছু না করে বেরিয়ে যায়
           MODE: "once"
           TOPIC: ${{ github.event.inputs.topic }}
           MAX_RUN_MIN: "345"
@@ -67,39 +67,39 @@ jobs:
           BGM_MOOD: "cinematic"
           BGM_VOL: "0.30"
           LUFS: "-14"
-          # --- sound effects (0 à¦¦à¦¿à¦²à§‡ à¦¸à¦¬ à¦¬à¦¨à§à¦§) ---
+          # --- sound effects (0 দিলে সব বন্ধ) ---
           SFX: "1"
           SFX_VOL: "0.5"
-          # --- à¦¨à¦¿à¦œà§‡à¦° sound library: Music_SFX_Library-à¦¤à§‡ sfx_*.wav/mp3, pack*.mp3 à¦¬à¦¾ Sounds folder à¦¥à¦¾à¦•à¦²à§‡ à¦¬à¦¸à¦¾à¦¯à¦¼ (0 = à¦¬à¦¨à§à¦§) ---
+          # --- নিজের sound library: Music_SFX_Library-তে sfx_*.wav/mp3, pack*.mp3 বা Sounds folder থাকলে বসায় (0 = বন্ধ) ---
           SOUND_LIB: "1"
           LIB_SILENCE_DB: "-38,-32,-26,-20"
-          # --- scene à¦¬à¦¦à¦²à§‡à¦° transition ---
+          # --- scene বদলের transition ---
           TRANSITION_SEC: "0.5"
           TRANSITION: "fade"
-          # à¦¸à¦¾à¦§à¦¾à¦°à¦£ fade-à¦à¦° à¦•à¦¤ à¦…à¦‚à¦¶ (0.6 = à§¬à§¦%) premium style (dissolve/smooth/iris/wipe/reveal/push/graydip) à¦¹à¦¬à§‡; 0 = à¦¬à¦¨à§à¦§
+          # সাধারণ fade-এর কত অংশ (0.6 = ৬০%) premium style (dissolve/smooth/iris/wipe/reveal/push/graydip) হবে; 0 = বন্ধ
           TRANSITION_MIX: "0.6"
           TRANS_SFX: "1"
           TRANS_SFX_VOL: "0.55"
           CLIP_AUDIO_VOL: "0.5"
-          # --- à¦ªà¦°à§à¦¦à¦¾à¦¯à¦¼ premium style à¦‡à¦‚à¦°à§‡à¦œà¦¿ text (0 = à¦¬à¦¨à§à¦§) ---
+          # --- পর্দায় premium style ইংরেজি text (0 = বন্ধ) ---
           SCREEN_TEXT: "1"
           TEXT_SIZE: "58"
-          # --- video à¦¶à§‡à¦·à§‡ à¦…à¦ªà§à¦°à¦¯à¦¼à§‹à¦œà¦¨à§€à¦¯à¦¼ à¦¸à¦¬ à¦¸à§à¦¥à¦¾à¦¯à¦¼à§€à¦­à¦¾à¦¬à§‡ à¦®à§‹à¦›à¦¾; Music_SFX_Library à¦•à¦–à¦¨à§‹ à¦®à§‹à¦›à¦¾ à¦¹à¦¯à¦¼ à¦¨à¦¾ (0 = à¦ªà¦°à¦¿à¦·à§à¦•à¦¾à¦° à¦¬à¦¨à§à¦§) ---
+          # --- video শেষে অপ্রয়োজনীয় সব স্থায়ীভাবে মোছা; Music_SFX_Library কখনো মোছা হয় না (0 = পরিষ্কার বন্ধ) ---
           CLEAN_AFTER_VIDEO: "1"
-          # --- final video export: 2K (2560x1440)à¥¤ 0 à¦¦à¦¿à¦²à§‡ à¦†à¦—à§‡à¦° à¦®à¦¤à§‹ 1080p; à¦¸à¦®à¦¯à¦¼ à¦¬à§‡à¦¶à¦¿ à¦²à¦¾à¦—à¦²à§‡ OUT_PRESET veryfast à¦•à¦°à§‹ ---
+          # --- final video export: 2K (2560x1440)। 0 দিলে আগের মতো 1080p; সময় বেশি লাগলে OUT_PRESET veryfast করো ---
           OUT_W: "2560"
           OUT_H: "1440"
           OUT_CRF: "18"
           OUT_PRESET: "fast"
-          # --- title/description/tags txt à¦¯à¦¾à¦¬à§‡ Output-à¦à¦° à¦¬à¦¾à¦‡à¦°à§‡ à¦à¦‡ à¦à¦•à¦Ÿà¦¾ folder-à¦ (à¦ªà§à¦°à¦¥à¦®à¦¬à¦¾à¦° bot à¦¨à¦¿à¦œà§‡ à¦¬à¦¾à¦¨à¦¾à¦¬à§‡) ---
+          # --- title/description/tags txt যাবে Output-এর বাইরে এই একটা folder-এ (প্রথমবার bot নিজে বানাবে) ---
           PACKAGES_FOLDER: "Video_Packages"
           LIBRARY_FOLDER: "Music_SFX_Library"
-          # --- YouTube: UniPost à¦¦à¦¿à¦¯à¦¼à§‡ à¦¸à¦°à¦¾à¦¸à¦°à¦¿ à¦†à¦ªà¦²à§‹à¦¡à¥¤ à¦¸à¦«à¦² à¦¹à¦²à§‡ Drive-à¦ à¦¥à¦¾à¦•à§‡ à¦¶à§à¦§à§ thumbnail prompt txt;
-          #     à¦¬à§à¦¯à¦°à§à¦¥ à¦¹à¦²à§‡ final video à¦†à¦° youtube_package.txt Drive-à¦ à¦¯à¦¾à¦¯à¦¼ ---
+          # --- YouTube: UniPost দিয়ে সরাসরি আপলোড। সফল হলে Drive-এ থাকে শুধু thumbnail prompt txt;
+          #     ব্যর্থ হলে final video আর youtube_package.txt Drive-এ যায় ---
           UNIPOST_API_KEY: ${{ secrets.UNIPOST_API_KEY }}
           UNIPOST_MODE: "publish"
           UNIPOST_PRIVACY: "unlisted"
-          # --- Blogger: topic à¦¤à¦¾à¦²à¦¿à¦•à¦¾ à¦¶à§à¦§à§ Blogger-à¦à¦° draft page-à¦à¥¤ Blogger à¦¨à¦¾ à¦šà¦²à¦²à§‡ bot à¦¥à¦¾à¦®à§‡ à¦†à¦° à¦ªà¦°à§‡à¦° run à¦¨à¦¿à¦œà§‡ à¦†à¦¬à¦¾à¦° à¦šà§‡à¦·à§à¦Ÿà¦¾ à¦•à¦°à§‡ ---
+          # --- Blogger: topic তালিকা শুধু Blogger-এর draft page-এ। Blogger না চললে bot থামে আর পরের run নিজে আবার চেষ্টা করে ---
           BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
           BLOGGER_WAIT_MIN: "10"
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
